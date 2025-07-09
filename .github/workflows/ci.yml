@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule: [cron: "40 1 * * *"]
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: rust version
+        run: |
+          rustc --version
+          cargo --version
+
+      - uses: taiki-e/install-action@cargo-nextest
+
+      - name: Run tests
+        run: make test
+
+      - run: make is-dirty
+
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: rust version
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: rustfmt
+        run: make check-fmt
+
+      - name: clippy
+        run: make clippy
+
+      - run: make buf-lint
+      - run: make proto
+
+      - run: make is-dirty
+
+  docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: rust version
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: rustdoc
+        run: make doc
+
+      - run: make is-dirty

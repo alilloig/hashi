@@ -1,0 +1,43 @@
+[package]
+name = "hashi"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+sui-sdk-types = { version = "0.0.6", features = ["serde", "hash"] }
+sui-crypto = { version = "0.0.6", features = ["ed25519"] }
+sui-rpc = { version = "0.0.6" }
+sui-http = "0.1.0"
+
+# dependencies for the protobuf definitions
+tonic = { version = "0.13.1", features = [ "zstd", "transport", "tls-webpki-roots" ] }
+prost = "0.13"
+prost-types = "0.13.3"
+bytes = { version = "1.5.0", features = ["serde"] }
+
+tonic-health = "0.13.1"
+serde = "1.0.219"
+serde_derive = "1.0.219"
+tonic-reflection = "0.13.1"
+axum = "0.8.4"
+tower = "0.5.2"
+tokio = { version = "1.46.1", features = ["full"] }
+prometheus = "0.13.0"
+tracing = "0.1.41"
+
+bin-version = { git = "https://github.com/MystenLabs/sui.git" }
+prometheus-closure-metric = { git = "https://github.com/MystenLabs/sui.git" }
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0.98"
+toml = "0.9.2"
+futures = "0.3.31"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+rustls = { version = "0.23.29", default-features = false, features = ["ring"] }
+ed25519-dalek = { version = "2.2.0", features = ["pem", "pkcs8"] }
+tonic-rustls = "0.2.0"
+x509-parser = { version = "0.17.0", features = ["verify"] }
+rcgen = "0.13"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+rand = "0.8"
