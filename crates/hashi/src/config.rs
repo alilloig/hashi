@@ -69,6 +69,12 @@ impl Config {
         }
     }
 
+    pub fn tls_public_key(&self) -> Result<ed25519_dalek::VerifyingKey, anyhow::Error> {
+        let tls_private_key = self.tls_private_key()?;
+
+        Ok(ed25519_dalek::VerifyingKey::from(&tls_private_key))
+    }
+
     pub fn https_address(&self) -> SocketAddr {
         self.https_address
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 443)))
@@ -95,4 +101,65 @@ impl Config {
             .as_deref()
             .unwrap_or("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
     }
+
+    // Creates a new config suitable for testing. In particular this config will:
+    // - have randomly generated private key material
+    // - localhost only listen addresses using available ports
+    #[cfg(test)]
+    pub fn new_for_testing() -> Self {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use std::ops::Deref;
+
+        let mut config = Config::default();
+
+        let tls_private_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        config.tls_private_key = Some(
+            tls_private_key
+                .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+                .unwrap()
+                .deref()
+                .to_owned(),
+        );
+
+        config.https_address = Some(SocketAddr::from(([127, 0, 0, 1], get_available_port())));
+        config.http_address = Some(SocketAddr::from(([127, 0, 0, 1], get_available_port())));
+        config.metrics_http_address =
+            Some(SocketAddr::from(([127, 0, 0, 1], get_available_port())));
+
+        config
+    }
+}
+
+/// Return an ephemeral, available port. On unix systems, the port returned will be in the
+/// TIME_WAIT state ensuring that the OS won't hand out this port for some grace period.
+/// Callers should be able to bind to this port given they use SO_REUSEADDR.
+#[cfg(test)]
+fn get_available_port() -> u16 {
+    const MAX_PORT_RETRIES: u32 = 1000;
+
+    for _ in 0..MAX_PORT_RETRIES {
+        if let Ok(port) = get_ephemeral_port() {
+            return port;
+        }
+    }
+
+    panic!("Error: could not find an available port on localhost");
+}
+
+#[cfg(test)]
+fn get_ephemeral_port() -> std::io::Result<u16> {
+    use std::net::{TcpListener, TcpStream};
+
+    // Request a random available port from the OS
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    let addr = listener.local_addr()?;
+
+    // Create and accept a connection (which we'll promptly drop) in order to force the port
+    // into the TIME_WAIT state, ensuring that the port will be reserved from some limited
+    // amount of time (roughly 60s on some Linux systems)
+    let _sender = TcpStream::connect(addr)?;
+    let _incoming = listener.accept()?;
+
+    Ok(addr.port())
 }

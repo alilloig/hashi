@@ -60,31 +60,18 @@ impl std::fmt::Display for ServerVersion {
 
 #[cfg(test)]
 mod test {
-    use std::ops::Deref;
-
+    use crate::config::Config;
+    use crate::proto::bridge_service_client::BridgeServiceClient;
+    use crate::proto::GetServiceInfoRequest;
     use crate::Hashi;
     use crate::ServerVersion;
-    use crate::config::Config;
-    use crate::proto::GetServiceInfoRequest;
-    use crate::proto::bridge_service_client::BridgeServiceClient;
 
     #[allow(clippy::field_reassign_with_default)]
     #[tokio::test]
     async fn tls() {
-        use ed25519_dalek::pkcs8::EncodePrivateKey;
-
         let server_version = ServerVersion::new("unknown", "unknown");
-        let tls_private_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let tls_public_key = ed25519_dalek::VerifyingKey::from(&tls_private_key);
-
-        let mut config = Config::default();
-        config.tls_private_key = Some(
-            tls_private_key
-                .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
-                .unwrap()
-                .deref()
-                .to_owned(),
-        );
+        let config = Config::new_for_testing();
+        let tls_public_key = config.tls_public_key().unwrap();
 
         let hashi = Hashi::new(server_version, config);
 
