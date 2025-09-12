@@ -1,7 +1,6 @@
 use anyhow::Result;
 use hashi::{Hashi, ServerVersion, config::Config as HashiConfig};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 use tracing::info;
 
 const HTTPS_SCHEME: &str = "https://";
@@ -126,11 +125,11 @@ mod tests {
 
     #[test]
     fn test_builder_fluent_api() {
-        const TEST_NUM_NODES: usize = 3;
+        const NUM_NODES: usize = 3;
 
-        let builder = HashiNetworkBuilder::new().with_num_nodes(TEST_NUM_NODES);
+        let builder = HashiNetworkBuilder::new().with_num_nodes(NUM_NODES);
 
-        assert_eq!(builder.num_nodes, TEST_NUM_NODES);
+        assert_eq!(builder.num_nodes, NUM_NODES);
     }
 
     #[test]
