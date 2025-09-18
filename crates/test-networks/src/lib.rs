@@ -1,21 +1,22 @@
 use anyhow::Result;
-use test_cluster::{TestCluster, TestClusterBuilder};
 
 pub mod bitcoin_node;
 pub mod hashi_network;
+pub mod sui_network;
 
 pub use bitcoin_node::{BitcoinNodeBuilder, BitcoinNodeHandle};
 pub use hashi_network::{HashiNetwork, HashiNetworkBuilder, HashiNodeHandle};
+pub use sui_network::{SuiNetworkBuilder, SuiNetworkHandle};
 
 pub struct TestNetworks {
-    pub sui_network: TestCluster,
+    pub sui_network: SuiNetworkHandle,
     pub hashi_network: HashiNetwork,
     pub bitcoin_node: BitcoinNodeHandle,
 }
 
 impl TestNetworks {
     pub async fn new() -> Result<Self> {
-        let sui_network = TestClusterBuilder::new().build().await;
+        let sui_network = SuiNetworkBuilder::default().build().await?;
         let hashi_network = HashiNetworkBuilder::new().build().await?;
         let bitcoin_node = BitcoinNodeBuilder::new().build().await?;
         let test_networks = Self {
@@ -30,7 +31,7 @@ impl TestNetworks {
         TestNetworksBuilder::new()
     }
 
-    pub fn sui_network(&self) -> &TestCluster {
+    pub fn sui_network(&self) -> &SuiNetworkHandle {
         &self.sui_network
     }
 
@@ -44,7 +45,7 @@ impl TestNetworks {
 }
 
 pub struct TestNetworksBuilder {
-    sui_builder: TestClusterBuilder,
+    sui_builder: SuiNetworkBuilder,
     hashi_builder: HashiNetworkBuilder,
     bitcoin_builder: BitcoinNodeBuilder,
 }
@@ -52,7 +53,7 @@ pub struct TestNetworksBuilder {
 impl TestNetworksBuilder {
     pub fn new() -> Self {
         Self {
-            sui_builder: TestClusterBuilder::new(),
+            sui_builder: SuiNetworkBuilder::default(),
             hashi_builder: HashiNetworkBuilder::new(),
             bitcoin_builder: BitcoinNodeBuilder::new(),
         }
@@ -80,7 +81,7 @@ impl TestNetworksBuilder {
     }
 
     pub async fn build(self) -> Result<TestNetworks> {
-        let sui_network = self.sui_builder.build().await;
+        let sui_network = self.sui_builder.build().await?;
         let hashi_network = self.hashi_builder.build().await?;
         let bitcoin_node = self.bitcoin_builder.build().await?;
         let test_networks = TestNetworks {
@@ -112,10 +113,7 @@ mod tests {
             .await?;
 
         assert_eq!(test_networks.hashi_network().nodes().len(), TEST_NUM_NODES);
-        assert_eq!(
-            test_networks.sui_network().get_validator_pubkeys().len(),
-            TEST_NUM_NODES
-        );
+        assert_eq!(test_networks.sui_network().num_validators, TEST_NUM_NODES);
         assert!(!test_networks.bitcoin_node().rpc_url().is_empty());
 
         Ok(())
