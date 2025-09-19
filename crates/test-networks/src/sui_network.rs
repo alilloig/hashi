@@ -1,15 +1,60 @@
 use anyhow::Result;
+use hashi::config::get_available_port;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use tempfile::TempDir;
 use tokio::time::{Duration, sleep};
 
-const DEFAULT_RPC_PORT: u16 = 9000;
-const DEFAULT_FAUCET_PORT: u16 = 9123;
 const DEFAULT_NUM_VALIDATORS: usize = 4;
 const DEFAULT_EPOCH_DURATION_MS: u64 = 60_000;
 const TEMP_DIR_PREFIX: &str = "sui-network-";
 const LOCALHOST: &str = "127.0.0.1";
+const HTTP_PREFIX: &str = "http://";
+const NETWORK_STARTUP_TIMEOUT_SECS: u64 = 10;
+const NETWORK_STARTUP_POLL_INTERVAL_SECS: u64 = 1;
+
+fn make_url(port: u16) -> String {
+    format!("{}{}:{}", HTTP_PREFIX, LOCALHOST, port)
+}
+
+fn ensure_sui_binary_exists(custom_path: &Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = custom_path {
+        return Ok(path.clone());
+    }
+    if let Ok(path) = std::env::var("SUI_BINARY") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(output) = Command::new("which").arg("sui").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let common_path = PathBuf::from(format!("{}/bin/sui", home));
+    if common_path.exists() {
+        return Ok(common_path);
+    }
+    anyhow::bail!("sui binary not found. Please install sui or set SUI_BINARY env var")
+}
+
+async fn wait_for_ready(port: u16) -> Result<()> {
+    let addr: std::net::SocketAddr = format!("{}:{}", LOCALHOST, port).parse()?;
+    for _ in 0..NETWORK_STARTUP_TIMEOUT_SECS {
+        if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+            drop(stream);
+            return Ok(());
+        }
+        sleep(Duration::from_secs(NETWORK_STARTUP_POLL_INTERVAL_SECS)).await;
+    }
+    anyhow::bail!(
+        "Network failed to start within {}s timeout on port {}",
+        NETWORK_STARTUP_TIMEOUT_SECS,
+        port
+    )
+}
 
 /// Handle for a Sui network running via pre-compiled binary
 pub struct SuiNetworkHandle {
@@ -32,36 +77,6 @@ pub struct SuiNetworkHandle {
 impl Drop for SuiNetworkHandle {
     fn drop(&mut self) {
         let _ = self.process.kill();
-    }
-}
-
-impl SuiNetworkHandle {
-    fn ensure_sui_binary_exists(custom_path: &Option<PathBuf>) -> Result<PathBuf> {
-        if let Some(path) = custom_path {
-            return Ok(path.clone());
-        }
-        if let Ok(path) = std::env::var("SUI_BINARY") {
-            return Ok(PathBuf::from(path));
-        }
-        if let Ok(output) = Command::new("which").arg("sui").output()
-            && output.status.success()
-        {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
-        }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let common_path = PathBuf::from(format!("{}/bin/sui", home));
-        if common_path.exists() {
-            return Ok(common_path);
-        }
-        anyhow::bail!("sui binary not found. Please install sui or set SUI_BINARY env var")
-    }
-
-    async fn wait_for_ready(_rpc_url: &str) -> Result<()> {
-        sleep(Duration::from_secs(2)).await;
-        Ok(())
     }
 }
 
@@ -99,16 +114,19 @@ impl SuiNetworkBuilder {
 
     pub async fn build(self) -> Result<SuiNetworkHandle> {
         let config_dir = tempfile::Builder::new().prefix(TEMP_DIR_PREFIX).tempdir()?;
-        let sui_binary = SuiNetworkHandle::ensure_sui_binary_exists(&self.sui_binary_path)?;
+        let sui_binary = ensure_sui_binary_exists(&self.sui_binary_path)?;
         self.generate_genesis(&sui_binary, &config_dir)?;
-        let process = self.start_network(&sui_binary, &config_dir)?;
-        let rpc_url = format!("http://{}:{}", LOCALHOST, DEFAULT_RPC_PORT);
-        SuiNetworkHandle::wait_for_ready(&rpc_url).await?;
+        let rpc_port = get_available_port();
+        let faucet_port = get_available_port();
+        let process = self.start_network(&sui_binary, &config_dir, rpc_port, faucet_port)?;
+        let rpc_url = make_url(rpc_port);
+        let faucet_url = make_url(faucet_port);
+        wait_for_ready(rpc_port).await?;
         Ok(SuiNetworkHandle {
             process,
             _config_dir: config_dir,
             rpc_url,
-            faucet_url: format!("http://{}:{}", LOCALHOST, DEFAULT_FAUCET_PORT),
+            faucet_url,
             graphql_url: None,
             num_validators: self.num_validators,
             epoch_duration_ms: self.epoch_duration_ms,
@@ -132,12 +150,20 @@ impl SuiNetworkBuilder {
         Ok(())
     }
 
-    fn start_network(&self, sui_binary: &PathBuf, config_dir: &TempDir) -> Result<Child> {
+    fn start_network(
+        &self,
+        sui_binary: &PathBuf,
+        config_dir: &TempDir,
+        rpc_port: u16,
+        faucet_port: u16,
+    ) -> Result<Child> {
         let mut cmd = Command::new(sui_binary);
         cmd.arg("start")
             .arg("--network.config")
             .arg(config_dir.path())
-            .arg("--with-faucet")
+            .arg("--fullnode-rpc-port")
+            .arg(rpc_port.to_string())
+            .arg(format!("--with-faucet={}:{}", LOCALHOST, faucet_port))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         Ok(cmd.spawn()?)
@@ -176,9 +202,10 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_sui_networks() -> Result<()> {
         use futures::future::join_all;
+        use std::collections::HashSet;
 
         const NUM_PARALLEL_NETWORKS: usize = 3;
-        const NUM_VALIDATORS: usize = 7;
+        const NUM_VALIDATORS: usize = 5;
 
         // Spawn multiple networks in parallel
         let network_futures: Vec<_> = (0..NUM_PARALLEL_NETWORKS)
@@ -194,14 +221,44 @@ mod tests {
         // Wait for all networks to start
         let results = join_all(network_futures).await;
 
-        // Verify all networks started successfully
+        // Verify all networks started successfully with unique ports
         let mut networks = Vec::new();
+        let mut rpc_ports = HashSet::new();
+        let mut faucet_ports = HashSet::new();
+
         for (i, result) in results {
             match result {
                 Ok(network) => {
+                    let rpc_port: u16 = network
+                        .rpc_url
+                        .split(':')
+                        .next_back()
+                        .and_then(|p| p.parse().ok())
+                        .expect("Failed to parse RPC port");
+                    let faucet_port: u16 = network
+                        .faucet_url
+                        .split(':')
+                        .next_back()
+                        .and_then(|p| p.parse().ok())
+                        .expect("Failed to parse faucet port");
+
+                    // Verify ports are unique
+                    assert!(
+                        rpc_ports.insert(rpc_port),
+                        "Network {} has duplicate RPC port {}",
+                        i,
+                        rpc_port
+                    );
+                    assert!(
+                        faucet_ports.insert(faucet_port),
+                        "Network {} has duplicate faucet port {}",
+                        i,
+                        faucet_port
+                    );
+
+                    // Verify network configuration
                     assert_eq!(network.num_validators, NUM_VALIDATORS);
-                    assert!(!network.rpc_url.is_empty());
-                    assert!(!network.faucet_url.is_empty());
+
                     networks.push(network);
                 }
                 Err(e) => {
@@ -209,6 +266,7 @@ mod tests {
                 }
             }
         }
+
         assert_eq!(networks.len(), NUM_PARALLEL_NETWORKS);
 
         Ok(())
