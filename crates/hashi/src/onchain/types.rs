@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use axum::http;
 use fastcrypto::bls12381::min_pk::BLS12381PublicKey;
-use sui_sdk_types::{Address, Ed25519PublicKey, TypeTag};
+use sui_sdk_types::{Address, TypeTag};
 
 use crate::bls::BlsCommittee;
 
