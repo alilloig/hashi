@@ -2,17 +2,25 @@
 /// Module: hashi
 module hashi::hashi;
 
-use hashi::{btc::BTC, committee_set::CommitteeSet, config::Config, treasury::Treasury};
+use hashi::{
+    btc::BTC,
+    committee::Committee,
+    committee_set::CommitteeSet,
+    config::Config,
+    proposal_set::{Self, ProposalSet},
+    treasury::Treasury
+};
 use std::string::String;
-use sui::{balance::Balance, coin::Coin, object_bag::ObjectBag, sui::SUI};
+use sui::{bag::{Self, Bag}, balance::Balance, coin::Coin, object_bag::ObjectBag, sui::SUI};
 
 public struct Hashi has key {
     id: UID,
-    committees: CommitteeSet,
+    committee_set: CommitteeSet,
     config: Config,
     treasury: Treasury,
     deposit_queue: hashi::deposit_queue::DepositRequestQueue,
     utxo_pool: hashi::utxo_pool::UtxoPool,
+    proposals: ProposalSet,
 }
 
 public fun deposit(
@@ -66,11 +74,12 @@ public fun confirm_deposit(
 fun init(ctx: &mut TxContext) {
     let hashi = Hashi {
         id: object::new(ctx),
-        committees: hashi::committee_set::create(ctx),
+        committee_set: hashi::committee_set::create(ctx),
         config: hashi::config::create(),
         treasury: hashi::treasury::create(ctx),
         deposit_queue: hashi::deposit_queue::create(ctx),
         utxo_pool: hashi::utxo_pool::create(ctx),
+        proposals: proposal_set::create(ctx),
     };
 
     sui::transfer::share_object(hashi);
@@ -111,14 +120,14 @@ public fun register_validator(
     ctx: &mut TxContext,
 ) {
     self.config.assert_version();
-    self.committees.new_member(sui_system, public_key, proof_of_possession_signature, ctx);
+    self.committee_set.new_member(sui_system, public_key, proof_of_possession_signature, ctx);
 }
 
 //TODO require the validator address passed in to better support operator address
 public fun update_https_address(self: &mut Hashi, https_address: String, ctx: &mut TxContext) {
     self.config.assert_version();
 
-    self.committees.set_https_address(ctx.sender(), https_address, ctx);
+    self.committee_set.set_https_address(ctx.sender(), https_address, ctx);
 }
 
 //TODO require the validator address passed in to better support operator address
@@ -129,7 +138,7 @@ public fun update_tls_public_key(
 ) {
     self.config.assert_version();
 
-    self.committees.set_tls_public_key(ctx.sender(), tls_public_key, ctx);
+    self.committee_set.set_tls_public_key(ctx.sender(), tls_public_key, ctx);
 }
 
 //TODO require the validator address passed in to better support operator address
@@ -140,7 +149,7 @@ public fun update_next_epoch_encryption_public_key(
 ) {
     self.config.assert_version();
     self
-        .committees
+        .committee_set
         .set_next_epoch_encryption_public_key(ctx.sender(), next_epoch_encryption_public_key, ctx);
 }
 
@@ -151,8 +160,36 @@ entry fun bootstrap(
 ) {
     self.config.assert_version();
 
-    assert!(self.committees.epoch() == 0);
-    assert!(!self.committees.has_committee(ctx.epoch()));
+    assert!(self.committee_set.epoch() == 0);
+    assert!(!self.committee_set.has_committee(ctx.epoch()));
 
-    self.committees.bootstrap(sui_system, ctx);
+    self.committee_set.bootstrap(sui_system, ctx);
+}
+
+public(package) fun config(self: &Hashi): &Config {
+    &self.config
+}
+
+public(package) fun config_mut(self: &mut Hashi): &mut Config {
+    &mut self.config
+}
+
+public(package) fun treasury(self: &Hashi): &Treasury {
+    &self.treasury
+}
+
+public(package) fun committee_set(self: &Hashi): &CommitteeSet {
+    &self.committee_set
+}
+
+public(package) fun current_committee(self: &Hashi): &Committee {
+    self.committee_set.current_committee()
+}
+
+public(package) fun treasury_mut(self: &mut Hashi): &mut Treasury {
+    &mut self.treasury
+}
+
+public(package) fun proposals_mut(self: &mut Hashi): &mut ProposalSet {
+    &mut self.proposals
 }

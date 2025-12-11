@@ -33,8 +33,8 @@ fun member(self: &CommitteeSet, validator_address: address): &MemberInfo {
     &self.members[validator_address]
 }
 
-fun has_member(self: &CommitteeSet, validator_address: address): bool {
-    self.members.contains_with_type<address, MemberInfo>(validator_address)
+public(package) fun has_member(self: &CommitteeSet, validator_address: address): bool {
+    self.members.contains_with_type<_, MemberInfo>(validator_address)
 }
 
 fun member_mut(self: &mut CommitteeSet, validator_address: address): &mut MemberInfo {
