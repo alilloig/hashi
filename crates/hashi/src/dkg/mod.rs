@@ -7,6 +7,7 @@ use crate::committee::Bls12381PrivateKey;
 use crate::committee::BlsSignatureAggregator;
 use crate::committee::Committee;
 use crate::communication::ChannelResult;
+use crate::communication::OrderedBroadcastChannel;
 use crate::communication::P2PChannel;
 use crate::communication::with_timeout_and_retry;
 use crate::dkg::types::Certificate;
@@ -45,14 +46,17 @@ pub use types::EncryptionGroupElement;
 pub use types::MessageHash;
 pub use types::RetrieveMessageRequest;
 pub use types::RetrieveMessageResponse;
+pub use types::RetrieveRotationMessagesRequest;
+pub use types::RetrieveRotationMessagesResponse;
 pub use types::RotationMessage;
 pub use types::RotationMessages;
 pub use types::SendMessageRequest;
 pub use types::SendMessageResponse;
+pub use types::SendRotationMessagesRequest;
+pub use types::SendRotationMessagesResponse;
 pub use types::SessionId;
 
 const ERR_PUBLISH_CERT_FAILED: &str = "Failed to publish certificate";
-#[allow(dead_code)]
 const EXPECT_THRESHOLD_VALIDATED: &str = "threshold already validated";
 const EXPECT_SERIALIZATION_SUCCESS: &str = "serialization should always succeed";
 
@@ -80,8 +84,12 @@ pub struct DkgManager {
     pub complaint_responses: HashMap<Address, complaint::ComplaintResponse<avss::SharesForNode>>,
     pub public_messages_store: Box<dyn PublicMessagesStore>,
     pub rotation_outputs: HashMap<ShareIndex, avss::PartialOutput>,
+    pub rotation_dealer_messages: HashMap<Address, RotationMessages>,
+    pub rotation_message_responses: HashMap<Address, SendRotationMessagesResponse>,
+    previous_dkg_output: Option<DkgOutput>,
 }
 
+// TODO: Factor out common code between DKG and key rotation.
 impl DkgManager {
     pub fn new(
         address: Address,
@@ -144,6 +152,9 @@ impl DkgManager {
             complaint_responses: HashMap::new(),
             public_messages_store: public_message_store,
             rotation_outputs: HashMap::new(),
+            rotation_dealer_messages: HashMap::new(),
+            rotation_message_responses: HashMap::new(),
+            previous_dkg_output: None,
         })
     }
 
@@ -190,6 +201,58 @@ impl DkgManager {
         Ok(RetrieveMessageResponse { message })
     }
 
+    /// RPC endpoint handler for `SendRotationMessagesRequest`
+    pub fn handle_send_rotation_messages_request(
+        &mut self,
+        sender: Address,
+        request: &SendRotationMessagesRequest,
+    ) -> DkgResult<SendRotationMessagesResponse> {
+        if let Some(existing_messages) = self.rotation_dealer_messages.get(&sender) {
+            let existing_hash = compute_rotation_messages_hash(existing_messages);
+            let incoming_hash = compute_rotation_messages_hash(&request.messages);
+            if existing_hash != incoming_hash {
+                return Err(DkgError::InvalidMessage {
+                    sender,
+                    reason: "Dealer sent different rotation messages".to_string(),
+                });
+            }
+            if let Some(response) = self.rotation_message_responses.get(&sender) {
+                return Ok(response.clone());
+            }
+            return Err(DkgError::InvalidMessage {
+                sender,
+                reason: "Rotation messages previously rejected due to invalid shares".to_string(),
+            });
+        }
+        let previous = self
+            .previous_dkg_output
+            .clone()
+            .ok_or_else(|| DkgError::ProtocolFailed("Rotation not started".to_string()))?;
+        self.rotation_dealer_messages
+            .insert(sender, request.messages.clone());
+        let signature = self.try_sign_rotation_messages(&previous, sender, &request.messages)?;
+        let response = SendRotationMessagesResponse { signature };
+        self.rotation_message_responses
+            .insert(sender, response.clone());
+        Ok(response)
+    }
+
+    /// RPC endpoint handler for `RetrieveRotationMessagesRequest`
+    pub fn handle_retrieve_rotation_messages_request(
+        &self,
+        request: &RetrieveRotationMessagesRequest,
+    ) -> DkgResult<RetrieveRotationMessagesResponse> {
+        let messages = self
+            .rotation_dealer_messages
+            .get(&request.dealer)
+            .ok_or_else(|| {
+                DkgError::NotFound(format!("Rotation messages for dealer {:?}", request.dealer))
+            })?;
+        Ok(RetrieveRotationMessagesResponse {
+            messages: messages.clone(),
+        })
+    }
+
     /// RPC endpoint handler for `ComplainRequest`
     pub fn handle_complain_request(
         &mut self,
@@ -228,7 +291,7 @@ impl DkgManager {
     pub async fn run(
         &mut self,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl crate::communication::OrderedBroadcastChannel<Certificate>,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
         rng: &mut impl fastcrypto::traits::AllowedRng,
     ) -> DkgResult<DkgOutput> {
         if ordered_broadcast_channel.existing_certificate_weight()
@@ -243,10 +306,33 @@ impl DkgManager {
             .await
     }
 
+    pub async fn run_key_rotation(
+        &mut self,
+        dkg_certificates: &[Certificate],
+        p2p_channel: &impl P2PChannel,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
+        rng: &mut impl fastcrypto::traits::AllowedRng,
+    ) -> DkgResult<DkgOutput> {
+        let previous = self.reconstruct_previous_dkg_output(dkg_certificates)?;
+        self.previous_dkg_output = Some(previous.clone());
+        // TODO(Optimization): Skip dealer phase if enough rotation certificates already exist.
+        if let Err(e) = self
+            .run_key_rotation_as_dealer(&previous, p2p_channel, ordered_broadcast_channel, rng)
+            .await
+        {
+            tracing::error!(
+                "Rotation dealer phase failed: {}. Continuing as party only.",
+                e
+            );
+        }
+        self.run_key_rotation_as_party(&previous, p2p_channel, ordered_broadcast_channel)
+            .await
+    }
+
     async fn run_as_dealer(
         &mut self,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl crate::communication::OrderedBroadcastChannel<Certificate>,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
         rng: &mut impl fastcrypto::traits::AllowedRng,
     ) -> DkgResult<()> {
         let message = self.create_dealer_message(rng);
@@ -302,7 +388,7 @@ impl DkgManager {
     async fn run_as_party(
         &mut self,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl crate::communication::OrderedBroadcastChannel<Certificate>,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
     ) -> DkgResult<DkgOutput> {
         let mut certified_dealers = HashSet::new();
         let mut dealer_weight_sum = 0u32;
@@ -370,6 +456,146 @@ impl DkgManager {
             }
         }
         self.complete_dkg(certified_dealers.into_iter())
+    }
+
+    async fn run_key_rotation_as_dealer(
+        &mut self,
+        previous: &DkgOutput,
+        p2p_channel: &impl P2PChannel,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
+        rng: &mut impl fastcrypto::traits::AllowedRng,
+    ) -> DkgResult<()> {
+        let rotation_messages = self.create_rotation_messages(previous, rng);
+        self.rotation_dealer_messages
+            .insert(self.address, rotation_messages.clone());
+        let my_signature = self
+            .try_sign_rotation_messages(previous, self.address, &rotation_messages)
+            .expect("own rotation messages should always be valid");
+        let messages_hash = compute_rotation_messages_hash(&rotation_messages);
+        let mut aggregator = BlsSignatureAggregator::new(
+            &self.committee,
+            Rotation(RotationDealerMessagesHash {
+                dealer_address: self.address,
+                messages_hash,
+            }),
+        );
+        aggregator
+            .add_signature_from(self.address, my_signature)
+            .expect("first signature should always be valid");
+        let recipients: Vec<_> = self
+            .committee
+            .members()
+            .iter()
+            .map(|m| m.validator_address())
+            .filter(|addr| *addr != self.address)
+            .collect();
+        let request = SendRotationMessagesRequest {
+            messages: rotation_messages.clone(),
+        };
+        let results = send_rotation_messages_to_many(p2p_channel, &recipients, &request).await;
+        for (addr, result) in results {
+            match result {
+                Ok(response) => {
+                    if let Err(e) = aggregator.add_signature_from(addr, response.signature.clone())
+                    {
+                        tracing::info!("Invalid rotation signature from {:?}: {}", addr, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::info!("Failed to send rotation messages to {:?}: {}", addr, e)
+                }
+            }
+        }
+        let required_weight = self.dkg_config.threshold + self.dkg_config.max_faulty;
+        if aggregator.weight() >= required_weight as u64 {
+            let cert = aggregator
+                .finish()
+                .expect("signatures should always be valid");
+            with_timeout_and_retry(|| ordered_broadcast_channel.publish(cert.clone()))
+                .await
+                .map_err(|e| {
+                    DkgError::BroadcastError(format!("{}: {}", ERR_PUBLISH_CERT_FAILED, e))
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn run_key_rotation_as_party(
+        &mut self,
+        previous: &DkgOutput,
+        p2p_channel: &impl P2PChannel,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
+    ) -> DkgResult<DkgOutput> {
+        let mut certified_share_indices: Vec<_> = self.rotation_outputs.keys().copied().collect();
+        let mut certified_dealers = HashSet::new();
+        loop {
+            if certified_share_indices.len() >= previous.threshold as usize {
+                break;
+            }
+            let cert = ordered_broadcast_channel
+                .receive()
+                .await
+                .map_err(|e| DkgError::BroadcastError(e.to_string()))?;
+            match &cert.message {
+                Rotation(message) => {
+                    let dealer = message.dealer_address;
+                    if certified_dealers.contains(&dealer) {
+                        continue;
+                    }
+                    if let Err(e) = self.committee.verify_signature(&cert) {
+                        tracing::info!(
+                            "Invalid rotation certificate signature from {:?}: {}",
+                            &dealer,
+                            e
+                        );
+                        continue;
+                    }
+                    let previous_nodes = self.previous_nodes.as_ref().ok_or_else(|| {
+                        DkgError::InvalidConfig("Key rotation requires previous nodes".into())
+                    })?;
+                    let previous_committee = self.previous_committee.as_ref().ok_or_else(|| {
+                        DkgError::InvalidConfig("Key rotation requires previous committee".into())
+                    })?;
+                    let dealer_party_id = previous_committee.index_of(&dealer).ok_or_else(|| {
+                        DkgError::InvalidMessage {
+                            sender: dealer,
+                            reason: "Dealer not in previous committee".into(),
+                        }
+                    })? as u16;
+                    let dealer_share_indices = previous_nodes
+                        .share_ids_of(dealer_party_id)
+                        .map_err(|_| DkgError::InvalidMessage {
+                            sender: dealer,
+                            reason: "Dealer has no shares in previous committee".into(),
+                        })?;
+                    let needs_retrieval = dealer_share_indices
+                        .iter()
+                        .any(|idx| !self.rotation_outputs.contains_key(idx));
+                    if needs_retrieval {
+                        tracing::info!(
+                            "Rotation messages from dealer {:?} not available, retrieving from signers",
+                            dealer
+                        );
+                        self.retrieve_rotation_messages(message, &cert, p2p_channel)
+                            .await
+                            .map_err(|e| {
+                                tracing::error!(
+                                    "Failed to retrieve rotation messages for dealer {:?}: {}",
+                                    dealer,
+                                    e
+                                );
+                                e
+                            })?;
+                        self.process_certified_rotation_message(&dealer, previous)?;
+                    }
+                    // TODO: Implement share recovery.
+                    certified_share_indices.extend(dealer_share_indices);
+                    certified_dealers.insert(dealer);
+                }
+                Dkg(_) => continue,
+            }
+        }
+        self.complete_key_rotation(previous, &certified_share_indices)
     }
 
     fn create_dealer_message(
@@ -456,6 +682,52 @@ impl DkgManager {
         Ok(())
     }
 
+    fn process_certified_rotation_message(
+        &mut self,
+        dealer: &Address,
+        previous_dkg_output: &DkgOutput,
+    ) -> DkgResult<()> {
+        let rotation_messages = self
+            .rotation_dealer_messages
+            .get(dealer)
+            .ok_or_else(|| DkgError::ProtocolFailed("No rotation messages for dealer".into()))?
+            .clone();
+        for rotation_message in &rotation_messages.messages {
+            let session_id = self
+                .session_id
+                .rotation_session_id(dealer, rotation_message.share_index);
+            let commitment = previous_dkg_output
+                .commitments
+                .iter()
+                .find(|c| c.index == rotation_message.share_index)
+                .map(|c| c.value);
+            let receiver = avss::Receiver::new(
+                self.dkg_config.nodes.clone(),
+                self.party_id,
+                self.dkg_config.threshold,
+                session_id.to_vec(),
+                commitment,
+                self.encryption_key.clone(),
+            );
+            match receiver.process_message(&rotation_message.message)? {
+                avss::ProcessedMessage::Valid(output) => {
+                    self.rotation_outputs
+                        .insert(rotation_message.share_index, output);
+                }
+                avss::ProcessedMessage::Complaint(_) => {
+                    return Err(DkgError::InvalidMessage {
+                        sender: *dealer,
+                        reason: format!(
+                            "Invalid rotation share for index {}",
+                            rotation_message.share_index
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn complete_dkg(
         &self,
         certified_dealers: impl Iterator<Item = Address>,
@@ -523,15 +795,6 @@ impl DkgManager {
             )
         })?;
         for signer_address in signers {
-            if signer_address == self.address {
-                tracing::error!(
-                    "Self in certificate signers but message not available for dealer {:?}.",
-                    message.dealer_address
-                );
-                return Err(DkgError::ProtocolFailed(
-                    "Self in certificate signers but message not available".to_string(),
-                ));
-            }
             match with_timeout_and_retry(|| p2p_channel.retrieve_message(&signer_address, &request))
                 .await
             {
@@ -558,7 +821,66 @@ impl DkgManager {
         ))
     }
 
-    // TODO: Implement share recovery for key rotation.
+    async fn retrieve_rotation_messages(
+        &mut self,
+        message: &RotationDealerMessagesHash,
+        certificate: &Certificate,
+        p2p_channel: &impl P2PChannel,
+    ) -> DkgResult<()> {
+        let request = RetrieveRotationMessagesRequest {
+            dealer: message.dealer_address,
+        };
+        if certificate
+            .is_signer(&self.address, &self.committee)
+            .map_err(|e| DkgError::CryptoError(e.to_string()))?
+        {
+            tracing::error!(
+                "Self in certificate signers but rotation messages not available for dealer {:?}.",
+                message.dealer_address
+            );
+            return Err(DkgError::ProtocolFailed(
+                "Self in certificate signers but rotation messages not available".to_string(),
+            ));
+        }
+        let signers = certificate.signers(&self.committee).map_err(|_| {
+            DkgError::ProtocolFailed(
+                "Certificate does not match the current epoch or committee".to_string(),
+            )
+        })?;
+        for signer_address in signers {
+            match with_timeout_and_retry(|| {
+                p2p_channel.retrieve_rotation_messages(&signer_address, &request)
+            })
+            .await
+            {
+                Ok(response) => {
+                    let messages_hash = compute_rotation_messages_hash(&response.messages);
+                    if messages_hash != message.messages_hash {
+                        tracing::info!(
+                            "Signer {:?} returned rotation messages with wrong hash",
+                            signer_address
+                        );
+                        continue;
+                    }
+                    self.rotation_dealer_messages
+                        .insert(message.dealer_address, response.messages.clone());
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::info!(
+                        "Failed to retrieve rotation messages from signer {:?}: {}",
+                        signer_address,
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+        Err(DkgError::PairwiseCommunicationError(
+            "Failed to retrieve rotation messages from any signer".to_string(),
+        ))
+    }
+
     async fn recover_shares_via_complaint(
         &mut self,
         dealer: &Address,
@@ -622,7 +944,6 @@ impl DkgManager {
         )))
     }
 
-    #[allow(dead_code)]
     fn create_rotation_messages(
         &self,
         previous_dkg_output: &DkgOutput,
@@ -656,7 +977,6 @@ impl DkgManager {
         RotationMessages { messages }
     }
 
-    #[allow(dead_code)]
     fn try_sign_rotation_messages(
         &mut self,
         previous_dkg_output: &DkgOutput,
@@ -748,7 +1068,6 @@ impl DkgManager {
         Ok(signature.signature().clone())
     }
 
-    #[allow(dead_code)]
     fn complete_key_rotation(
         &mut self,
         previous_dkg_output: &DkgOutput,
@@ -791,7 +1110,6 @@ impl DkgManager {
     }
 
     // TODO: Handle new committee members who weren't in the previous committee.
-    #[allow(dead_code)]
     fn reconstruct_previous_dkg_output(
         &mut self,
         certificates: &[Certificate],
@@ -865,6 +1183,22 @@ async fn send_dkg_message_to_many(
     .await
 }
 
+async fn send_rotation_messages_to_many(
+    p2p_channel: &impl P2PChannel,
+    recipients: &[Address],
+    request: &SendRotationMessagesRequest,
+) -> Vec<(Address, ChannelResult<SendRotationMessagesResponse>)> {
+    join_all(recipients.iter().map(|addr| {
+        let addr = *addr;
+        async move {
+            let result =
+                with_timeout_and_retry(|| p2p_channel.send_rotation_messages(&addr, request)).await;
+            (addr, result)
+        }
+    }))
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,7 +1216,6 @@ mod tests {
     use fastcrypto_tbls::random_oracle::RandomOracle;
     use fastcrypto_tbls::threshold_schnorr::avss;
     use std::collections::BTreeMap;
-    use std::collections::HashSet;
 
     struct MockPublicMessagesStore;
 
@@ -1144,6 +1477,28 @@ mod tests {
             .map_err(|e| DkgError::CryptoError(e.to_string()))
     }
 
+    fn create_rotation_test_certificate(
+        committee: &Committee,
+        rotation_messages: &RotationMessages,
+        dealer_address: Address,
+        signatures: Vec<MemberSignature>,
+    ) -> DkgResult<Certificate> {
+        let messages_hash = compute_rotation_messages_hash(rotation_messages);
+        let rotation_message = Rotation(RotationDealerMessagesHash {
+            dealer_address,
+            messages_hash,
+        });
+        let mut aggregator = BlsSignatureAggregator::new(committee, rotation_message);
+        for signature in signatures {
+            aggregator
+                .add_signature(signature)
+                .map_err(|e| DkgError::CryptoError(e.to_string()))?;
+        }
+        aggregator
+            .finish()
+            .map_err(|e| DkgError::CryptoError(e.to_string()))
+    }
+
     struct MockP2PChannel {
         managers: std::sync::Arc<std::sync::Mutex<HashMap<Address, DkgManager>>>,
         current_sender: Address,
@@ -1223,6 +1578,52 @@ mod tests {
             })?;
             Ok(response)
         }
+
+        async fn send_rotation_messages(
+            &self,
+            recipient: &Address,
+            request: &SendRotationMessagesRequest,
+        ) -> ChannelResult<SendRotationMessagesResponse> {
+            let mut managers = self.managers.lock().unwrap();
+            let manager = managers.get_mut(recipient).ok_or_else(|| {
+                crate::communication::ChannelError::RequestFailed(format!(
+                    "Recipient {:?} not found",
+                    recipient
+                ))
+            })?;
+            let response = manager
+                .handle_send_rotation_messages_request(self.current_sender, request)
+                .map_err(|e| {
+                    crate::communication::ChannelError::RequestFailed(format!(
+                        "Handler failed: {}",
+                        e
+                    ))
+                })?;
+            Ok(response)
+        }
+
+        async fn retrieve_rotation_messages(
+            &self,
+            party: &Address,
+            request: &RetrieveRotationMessagesRequest,
+        ) -> ChannelResult<RetrieveRotationMessagesResponse> {
+            let managers = self.managers.lock().unwrap();
+            let manager = managers.get(party).ok_or_else(|| {
+                crate::communication::ChannelError::RequestFailed(format!(
+                    "Party {:?} not found",
+                    party
+                ))
+            })?;
+            let response = manager
+                .handle_retrieve_rotation_messages_request(request)
+                .map_err(|e| {
+                    crate::communication::ChannelError::RequestFailed(format!(
+                        "Handler failed: {}",
+                        e
+                    ))
+                })?;
+            Ok(response)
+        }
     }
 
     struct MockOrderedBroadcastChannel {
@@ -1261,7 +1662,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::communication::OrderedBroadcastChannel<Certificate> for MockOrderedBroadcastChannel {
+    impl OrderedBroadcastChannel<Certificate> for MockOrderedBroadcastChannel {
         async fn publish(&self, message: Certificate) -> ChannelResult<()> {
             if let Some(ref error_msg) = self.fail_on_publish {
                 return Err(crate::communication::ChannelError::RequestFailed(
@@ -1346,6 +1747,26 @@ mod tests {
                 self.error_message.clone(),
             ))
         }
+
+        async fn send_rotation_messages(
+            &self,
+            _recipient: &Address,
+            _request: &SendRotationMessagesRequest,
+        ) -> ChannelResult<SendRotationMessagesResponse> {
+            Err(crate::communication::ChannelError::RequestFailed(
+                self.error_message.clone(),
+            ))
+        }
+
+        async fn retrieve_rotation_messages(
+            &self,
+            _party: &Address,
+            _request: &RetrieveRotationMessagesRequest,
+        ) -> ChannelResult<RetrieveRotationMessagesResponse> {
+            Err(crate::communication::ChannelError::RequestFailed(
+                self.error_message.clone(),
+            ))
+        }
     }
 
     struct SucceedingP2PChannel {
@@ -1401,6 +1822,22 @@ mod tests {
             _request: &ComplainRequest,
         ) -> ChannelResult<ComplainResponse> {
             unimplemented!("SucceedingP2PChannel does not implement complain")
+        }
+
+        async fn send_rotation_messages(
+            &self,
+            _recipient: &Address,
+            _request: &SendRotationMessagesRequest,
+        ) -> ChannelResult<SendRotationMessagesResponse> {
+            unimplemented!("SucceedingP2PChannel does not implement send_rotation_messages")
+        }
+
+        async fn retrieve_rotation_messages(
+            &self,
+            _party: &Address,
+            _request: &RetrieveRotationMessagesRequest,
+        ) -> ChannelResult<RetrieveRotationMessagesResponse> {
+            unimplemented!("SucceedingP2PChannel does not implement retrieve_rotation_messages")
         }
     }
 
@@ -1482,6 +1919,24 @@ mod tests {
         ) -> ChannelResult<ComplainResponse> {
             unimplemented!("PartiallyFailingP2PChannel does not implement complain")
         }
+
+        async fn send_rotation_messages(
+            &self,
+            _recipient: &Address,
+            _request: &SendRotationMessagesRequest,
+        ) -> ChannelResult<SendRotationMessagesResponse> {
+            unimplemented!("PartiallyFailingP2PChannel does not implement send_rotation_messages")
+        }
+
+        async fn retrieve_rotation_messages(
+            &self,
+            _party: &Address,
+            _request: &RetrieveRotationMessagesRequest,
+        ) -> ChannelResult<RetrieveRotationMessagesResponse> {
+            unimplemented!(
+                "PartiallyFailingP2PChannel does not implement retrieve_rotation_messages"
+            )
+        }
     }
 
     /// P2P channel that returns pre-collected complaint responses.
@@ -1530,6 +1985,22 @@ mod tests {
                     crate::communication::ChannelError::RequestFailed("No response".into())
                 })
         }
+
+        async fn send_rotation_messages(
+            &self,
+            _recipient: &Address,
+            _request: &SendRotationMessagesRequest,
+        ) -> ChannelResult<SendRotationMessagesResponse> {
+            unimplemented!("PreCollectedP2PChannel does not implement send_rotation_messages")
+        }
+
+        async fn retrieve_rotation_messages(
+            &self,
+            _party: &Address,
+            _request: &RetrieveRotationMessagesRequest,
+        ) -> ChannelResult<RetrieveRotationMessagesResponse> {
+            unimplemented!("PreCollectedP2PChannel does not implement retrieve_rotation_messages")
+        }
     }
 
     struct FailingOrderedBroadcastChannel {
@@ -1539,7 +2010,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::communication::OrderedBroadcastChannel<Certificate> for FailingOrderedBroadcastChannel {
+    impl OrderedBroadcastChannel<Certificate> for FailingOrderedBroadcastChannel {
         async fn publish(&self, _message: Certificate) -> ChannelResult<()> {
             if self.fail_on_publish {
                 Err(crate::communication::ChannelError::RequestFailed(
@@ -1978,7 +2449,6 @@ mod tests {
         );
 
         // Verify all certificates were consumed from the TOB channel (only threshold needed)
-        use crate::communication::OrderedBroadcastChannel;
         assert_eq!(
             mock_tob.pending_messages(),
             Some(other_certificates_len - threshold as usize),
@@ -2238,7 +2708,6 @@ mod tests {
         assert_eq!(output.commitments.len(), num_validators); // total weight = 5
 
         // Verify TOB consumed exactly threshold certificates
-        use crate::communication::OrderedBroadcastChannel;
         assert_eq!(mock_tob.pending_messages(), Some(0));
     }
 
@@ -2476,7 +2945,6 @@ mod tests {
         assert_eq!(output.commitments.len(), setup.num_validators()); // total weight = 5
 
         // TOB should have consumed at least threshold certificates
-        use crate::communication::OrderedBroadcastChannel;
         let remaining = mock_tob.pending_messages().unwrap();
         assert!(
             remaining < num_certs,
@@ -2552,7 +3020,6 @@ mod tests {
         assert_eq!(output.commitments.len(), setup.num_validators()); // total weight = 5
 
         // Verify TOB consumed all 3 messages (not just the first 2)
-        use crate::communication::OrderedBroadcastChannel;
         assert_eq!(mock_tob.pending_messages(), Some(0));
     }
 
@@ -2876,7 +3343,6 @@ mod tests {
         // BTreeMap ordering of addresses: [0,0,0,...], [1,1,1,...], [2,2,2,...], etc
         // Weights: addr0=1, addr1=1, addr2=1, addr3=2, addr4=2
         // Should consume addr0 (weight 1) + addr1 (weight 1) + addr2 (weight 1) = total weight 3 >= threshold
-        use crate::communication::OrderedBroadcastChannel;
         let remaining = mock_tob.pending_messages().unwrap();
         assert_eq!(
             remaining, 2,
@@ -2918,7 +3384,6 @@ mod tests {
         assert!(result.is_ok());
 
         // Should consume exactly 2 certificates (weight 1+1 = 2 = threshold)
-        use crate::communication::OrderedBroadcastChannel;
         let remaining = mock_tob.pending_messages().unwrap();
         assert_eq!(
             remaining, 3,
@@ -2971,7 +3436,6 @@ mod tests {
         //                dealer1 (weight 1), skip dealer1 duplicate,
         //                dealer2 (weight 1) - now we have weight 3 >= threshold
         // Should NOT process: dealer3 (since we already have enough weight)
-        use crate::communication::OrderedBroadcastChannel;
         let remaining = mock_tob.pending_messages().unwrap();
 
         // We started with 6 certificates
@@ -4640,11 +5104,40 @@ mod tests {
             }
         }
 
+        fn certificates(&self) -> Vec<Certificate> {
+            self.certificates.values().cloned().collect()
+        }
+
         fn create_receiver_with_completed_dkg(
             &self,
             receiver_index: usize,
         ) -> (DkgManager, DkgOutput) {
             let mut receiver_manager = self.setup.create_manager(receiver_index);
+
+            // Process all dealer messages
+            for (i, message) in self.dealer_messages.iter().enumerate() {
+                let dealer_address = self.setup.address(self.dealer_indices[i]);
+                receive_dealer_message(&mut receiver_manager, message, dealer_address).unwrap();
+            }
+
+            // Complete DKG
+            let dkg_output = receiver_manager
+                .complete_dkg(self.certificates.keys().copied())
+                .unwrap();
+
+            (receiver_manager, dkg_output)
+        }
+
+        /// Creates a manager with InMemoryPublicMessagesStore and completed DKG.
+        /// The store contains all dealer messages for later reconstruction.
+        fn create_receiver_with_memory_store(
+            &self,
+            receiver_index: usize,
+        ) -> (DkgManager, DkgOutput) {
+            let mut receiver_manager = self.setup.create_manager_with_store(
+                receiver_index,
+                Box::new(InMemoryPublicMessagesStore::new()),
+            );
 
             // Process all dealer messages
             for (i, message) in self.dealer_messages.iter().enumerate() {
@@ -4667,6 +5160,34 @@ mod tests {
         ) -> (DkgManager, DkgOutput, RotationMessages) {
             let mut rng = rand::thread_rng();
             let mut dealer_manager = self.setup.create_manager(dealer_index);
+
+            // Process all dealer messages
+            for (i, message) in self.dealer_messages.iter().enumerate() {
+                let dealer_address = self.setup.address(self.dealer_indices[i]);
+                receive_dealer_message(&mut dealer_manager, message, dealer_address).unwrap();
+            }
+
+            // Complete DKG
+            let dkg_output = dealer_manager
+                .complete_dkg(self.certificates.keys().copied())
+                .unwrap();
+
+            // Create rotation messages
+            let rotation_messages = dealer_manager.create_rotation_messages(&dkg_output, &mut rng);
+
+            (dealer_manager, dkg_output, rotation_messages)
+        }
+
+        /// Creates a rotation dealer with InMemoryPublicMessagesStore.
+        fn create_rotation_dealer_with_memory_store(
+            &self,
+            dealer_index: usize,
+        ) -> (DkgManager, DkgOutput, RotationMessages) {
+            let mut rng = rand::thread_rng();
+            let mut dealer_manager = self.setup.create_manager_with_store(
+                dealer_index,
+                Box::new(InMemoryPublicMessagesStore::new()),
+            );
 
             // Process all dealer messages
             for (i, message) in self.dealer_messages.iter().enumerate() {
@@ -4902,5 +5423,130 @@ mod tests {
             receiver_manager.rotation_outputs.is_empty(),
             "No rotation outputs should be stored when validation fails"
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_key_rotation() {
+        let mut rng = rand::thread_rng();
+        let rotation_setup = RotationTestSetup::new();
+        // RotationTestSetup uses weights [3, 2, 4, 1, 2] (total = 12, threshold = 4)
+        // Dealers are validators 0, 1, 4
+
+        // Create test_manager (validator 0, weight=3) with memory store for message retrieval
+        let (mut test_manager, test_dkg_output, _) =
+            rotation_setup.create_rotation_dealer_with_memory_store(0);
+        let test_addr = rotation_setup.setup.address(0);
+        test_manager.previous_dkg_output = Some(test_dkg_output.clone());
+
+        // Create other managers for MockP2PChannel (validators 1-4)
+        let mut other_managers_map = HashMap::new();
+        for i in 1..5 {
+            let (mut manager, output) = rotation_setup.create_receiver_with_memory_store(i);
+            manager.previous_dkg_output = Some(output);
+            other_managers_map.insert(rotation_setup.setup.address(i), manager);
+        }
+        let mock_p2p = MockP2PChannel::new(other_managers_map, test_addr);
+
+        // Create rotation certificates covering < threshold share indices
+        // so test_manager must run as dealer.
+        // Validator 3 has weight=1 (1 share index), which is < threshold (4).
+        let mut rotation_certificates = Vec::new();
+        {
+            let mut other_managers = mock_p2p.managers.lock().unwrap();
+            let validator_idx = 3; // weight = 1
+            let addr = rotation_setup.setup.address(validator_idx);
+            let manager = other_managers.get_mut(&addr).unwrap();
+            let prev_output = manager.previous_dkg_output.clone().unwrap();
+
+            // Create rotation messages
+            let rotation_messages = manager.create_rotation_messages(&prev_output, &mut rng);
+            manager
+                .rotation_dealer_messages
+                .insert(addr, rotation_messages.clone());
+
+            // Sign own messages
+            let own_sig = manager
+                .try_sign_rotation_messages(&prev_output, addr, &rotation_messages)
+                .unwrap();
+
+            // Collect signature from test_manager
+            test_manager
+                .rotation_dealer_messages
+                .insert(addr, rotation_messages.clone());
+            let test_sig = test_manager
+                .try_sign_rotation_messages(&test_dkg_output, addr, &rotation_messages)
+                .unwrap();
+
+            // Create certificate
+            let epoch = manager.dkg_config.epoch;
+            let own_member_sig = MemberSignature::new(epoch, addr, own_sig);
+            let test_member_sig = MemberSignature::new(epoch, test_addr, test_sig);
+            let cert = create_rotation_test_certificate(
+                rotation_setup.setup.committee(),
+                &rotation_messages,
+                addr,
+                vec![own_member_sig, test_member_sig],
+            )
+            .unwrap();
+            rotation_certificates.push(cert);
+        }
+
+        // Create mock TOB with rotation certificates
+        let mut mock_tob = MockOrderedBroadcastChannel::new(rotation_certificates);
+
+        // Run key rotation
+        let new_output = test_manager
+            .run_key_rotation(
+                &rotation_setup.certificates(),
+                &mock_p2p,
+                &mut mock_tob,
+                &mut rng,
+            )
+            .await
+            .unwrap();
+
+        // Verify results
+        // Validator 0 has weight=3, so should have 3 shares
+        assert_eq!(
+            new_output.key_shares.shares.len(),
+            3,
+            "Should have shares equal to validator weight"
+        );
+
+        // Verify threshold is preserved
+        assert_eq!(
+            new_output.threshold, test_dkg_output.threshold,
+            "Threshold should be preserved after rotation"
+        );
+
+        // Verify public key is preserved
+        assert_eq!(
+            new_output.public_key, test_dkg_output.public_key,
+            "Public key should be preserved after rotation"
+        );
+
+        // Verify commitments exist for all share indices (total weight = 12)
+        assert_eq!(
+            new_output.commitments.len(),
+            12,
+            "Should have commitments for all share indices"
+        );
+
+        // Verify test_manager published its own rotation certificate
+        let published = mock_tob.published.lock().unwrap();
+        assert_eq!(
+            published.len(),
+            1,
+            "Test manager should have published one rotation certificate"
+        );
+        match &published[0].message {
+            Rotation(m) => {
+                assert_eq!(
+                    m.dealer_address, test_addr,
+                    "Published certificate should be from test manager"
+                );
+            }
+            _ => panic!("Expected rotation certificate"),
+        }
     }
 }
