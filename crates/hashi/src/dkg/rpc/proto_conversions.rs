@@ -180,6 +180,18 @@ impl TryFrom<&proto::ComplainResponse> for types::ComplainResponse {
 }
 
 //
+// GetPublicDkgOutputRequest
+//
+
+impl types::GetPublicDkgOutputRequest {
+    pub fn to_proto(&self) -> proto::GetPublicDkgOutputRequest {
+        proto::GetPublicDkgOutputRequest {
+            epoch: Some(self.epoch),
+        }
+    }
+}
+
+//
 // RotationComplainRequest
 //
 
@@ -191,6 +203,62 @@ impl types::RotationComplainRequest {
             share_index: Some(self.share_index.get() as u32),
             complaint: Some(serialize_bcs(&self.complaint)),
         }
+    }
+}
+
+impl TryFrom<&proto::GetPublicDkgOutputRequest> for types::GetPublicDkgOutputRequest {
+    type Error = TryFromProtoError;
+
+    fn try_from(value: &proto::GetPublicDkgOutputRequest) -> Result<Self, Self::Error> {
+        let epoch = required(value.epoch, "epoch")?;
+        Ok(Self { epoch })
+    }
+}
+
+//
+// GetPublicDkgOutputResponse
+//
+
+impl From<&types::GetPublicDkgOutputResponse> for proto::GetPublicDkgOutputResponse {
+    fn from(value: &types::GetPublicDkgOutputResponse) -> Self {
+        Self {
+            public_key: Some(serialize_bcs(&value.output.public_key)),
+            commitments: value
+                .output
+                .commitments
+                .iter()
+                .map(|(&index, value)| (index.get() as u32, serialize_bcs(value)))
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<&proto::GetPublicDkgOutputResponse> for types::GetPublicDkgOutputResponse {
+    type Error = TryFromProtoError;
+
+    fn try_from(value: &proto::GetPublicDkgOutputResponse) -> Result<Self, Self::Error> {
+        use fastcrypto_tbls::threshold_schnorr::G;
+        use fastcrypto_tbls::types::ShareIndex;
+        use std::collections::BTreeMap;
+
+        let public_key = deserialize_bcs(
+            required(value.public_key.as_ref(), "public_key")?,
+            "public_key",
+        )?;
+        let mut commitments = BTreeMap::new();
+        for (&index, bcs) in &value.commitments {
+            let share_index = ShareIndex::new(index as u16).ok_or_else(|| {
+                TryFromProtoError::invalid("commitments.key", "index must be non-zero")
+            })?;
+            let commitment_value: G = deserialize_bcs(bcs, "commitments.value")?;
+            commitments.insert(share_index, commitment_value);
+        }
+        Ok(Self {
+            output: types::PublicDkgOutput {
+                public_key,
+                commitments,
+            },
+        })
     }
 }
 
