@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package sui.hashi.v1alpha;
+
+import "sui/hashi/v1alpha/signature.proto";
+
+service GuardianService {
+  // Query the service for general information about its current state.
+  rpc GetGuardianInfo(GetGuardianInfoRequest) returns (GetGuardianInfoResponse);
+
+  // Setup mode only: generate a new BTC key and distribute encrypted shares.
+  rpc SetupNewKey(SetupNewKeyRequest) returns (SignedSetupNewKeyResponse);
+
+  // Operator initialization: provide config and commitments before provisioning.
+  rpc OperatorInit(OperatorInitRequest) returns (OperatorInitResponse);
+
+  // Provisioner initialization: submit encrypted share and readiness info.
+  rpc ProvisionerInit(ProvisionerInitRequest) returns (ProvisionerInitResponse);
+}
+
+message GetGuardianInfoRequest {}
+
+// TODO: Add more info
+message GetGuardianInfoResponse {
+  // AWS Nitro attestation
+  optional bytes attestation = 1;
+
+  // Software version of the service. Similar to the `server` http header.
+  optional string server = 2;
+}
+
+// =======================
+//      SetupNewKey
+// =======================
+
+// Untrusted wire DTO. Converted to a validated domain request in the server.
+message SetupNewKeyRequest {
+  // HPKE public keys for key provisioners (NUM_OF_SHARES entries expected).
+  repeated bytes key_provisioner_public_keys = 1;
+}
+
+// Ciphertext produced by HPKE encryption.
+message HPKECiphertext {
+  optional bytes encapsulated_key = 1;
+  optional bytes aes_ciphertext = 2;
+}
+
+// ShareID (NonZeroU16 in Rust). Validate 1 <= id <= 65535 in conversion.
+message GuardianShareID {
+  optional uint32 id = 1;
+}
+
+// Encrypted secret share sent to a key provisioner.
+message GuardianShareEncrypted {
+  GuardianShareID id = 1;
+  HPKECiphertext ciphertext = 2;
+}
+
+// Commitment to a secret share.
+message GuardianShareCommitment {
+  GuardianShareID id = 1;
+  optional bytes digest = 2;
+}
+
+// Unsigned response payload.
+message SetupNewKeyResponseData {
+  repeated GuardianShareEncrypted encrypted_shares = 1;
+  repeated GuardianShareCommitment share_commitments = 2;
+}
+
+// Application-layer signed response.
+message SignedSetupNewKeyResponse {
+  SetupNewKeyResponseData data = 1;
+
+  // Milliseconds since Unix epoch.
+  optional uint64 timestamp_ms = 2;
+
+  // Signature over (intent || data || timestamp).
+  optional bytes signature = 3;
+}
+
+// =======================
+//      OperatorInit
+// =======================
+
+message OperatorInitRequest {
+  // S3 access keys
+  S3Config s3_config = 1;
+
+  // Commitments published by the operator for the shares generated during setup.
+  repeated GuardianShareCommitment share_commitments = 2;
+
+  // Network the guardian is operating on.
+  optional Network network = 3;
+}
+
+message OperatorInitResponse {}
+
+message S3Config {
+  optional string access_key = 1;
+  optional string secret_key = 2;
+  optional string bucket_name = 3;
+}
+
+enum Network {
+  MAINNET = 0;
+  TESTNET = 1;
+  REGTEST = 2;
+}
+
+// ==========================
+//      ProvisionerInit
+// ==========================
+
+message ProvisionerInitRequest {
+  // Encrypted share destined for this provisioner.
+  GuardianShareEncrypted encrypted_share = 1;
+
+  // State used to initialize/restore the enclave. The share encryption binds to its digest as AAD.
+  ProvisionerInitState state = 2;
+}
+
+message ProvisionerInitState {
+  // Committee info for Hashi.
+  Committee hashi_committee = 1;
+
+  // Withdrawal policy configuration.
+  WithdrawalConfig withdrawal_config = 2;
+
+  // Current withdrawal state.
+  WithdrawalState withdrawal_state = 3;
+
+  // X-only public key bytes (32 bytes).
+  optional bytes hashi_btc_master_pubkey = 4;
+}
+
+message WithdrawalConfig {
+  // Committee threshold expressed in terms of weight.
+  optional uint64 committee_threshold = 1;
+
+  // The min delay after which any withdrawal is approved.
+  optional uint64 delayed_withdrawals_min_delay = 2;
+
+  // The max delay after which pending withdrawals are cleaned up.
+  optional uint64 delayed_withdrawals_timeout = 3;
+}
+
+message WithdrawalState {
+  // Total number of withdrawals processed till now.
+  optional uint64 num_withdrawals = 1;
+}
+
+message ProvisionerInitResponse {}

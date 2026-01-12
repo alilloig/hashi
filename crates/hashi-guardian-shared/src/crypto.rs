@@ -3,6 +3,7 @@ use crate::GuardianError::InvalidInputs;
 use crate::GuardianResult;
 use crate::GuardianSigned;
 use crate::SigningIntent;
+use crate::ToBytes;
 use ed25519_consensus::SigningKey;
 use ed25519_consensus::VerificationKey;
 use hpke::aead::AesGcm256;
@@ -50,7 +51,7 @@ pub struct Share {
 pub const THRESHOLD: usize = 3;
 pub const NUM_OF_SHARES: usize = 5;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct EncryptedShare {
     pub id: ShareID,
     pub ciphertext: Ciphertext,
@@ -64,10 +65,10 @@ pub struct ShareCommitment {
 
 pub type DigestBytes = Vec<u8>;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Ciphertext {
-    encapsulated_key: Vec<u8>,
-    aes_ciphertext: Vec<u8>,
+    pub encapsulated_key: Vec<u8>,
+    pub aes_ciphertext: Vec<u8>,
 }
 
 // ---------------------------------
@@ -86,15 +87,6 @@ impl EncKeyPair {
 
     pub fn public_key(&self) -> &EncPubKey {
         &self.pk
-    }
-}
-
-impl Ciphertext {
-    pub fn new(encapsulated_key: EncapsulatedKey, aes_ciphertext: Vec<u8>) -> Self {
-        Ciphertext {
-            encapsulated_key: encapsulated_key.to_bytes().to_vec(),
-            aes_ciphertext,
-        }
     }
 }
 
@@ -123,7 +115,10 @@ pub fn encrypt<R: CryptoRng + RngCore>(
             rng,
         )
         .map_err(|e| InvalidInputs(format!("Encryption failed: {}", e)))?;
-    Ok(Ciphertext::new(encapsulated_key, aes_ciphertext))
+    Ok(Ciphertext {
+        encapsulated_key: encapsulated_key.to_bytes().to_vec(),
+        aes_ciphertext,
+    })
 }
 
 /// Decrypts ciphertext. Returns InvalidInputs if aad is invalid.
@@ -248,11 +243,12 @@ pub fn encrypt_share<R: CryptoRng + RngCore>(
     pk: &EncPubKey,
     aad: Option<&[u8; 32]>,
     rng: &mut R,
-) -> GuardianResult<EncryptedShare> {
-    Ok(EncryptedShare {
+) -> EncryptedShare {
+    EncryptedShare {
         id: share.id,
-        ciphertext: encrypt(&share.value.to_bytes(), pk, aad, rng)?,
-    })
+        ciphertext: encrypt(&share.value.to_bytes(), pk, aad, rng)
+            .expect("neither plaintext nor aad are long"),
+    }
 }
 
 /// Decrypt an encrypted share with optional AAD
@@ -278,11 +274,11 @@ pub fn decrypt_share(
 // ---------------------------------
 
 /// Methods for `Signed<T>` wrapper - signing and verification
-impl<T: Serialize + SigningIntent> GuardianSigned<T> {
+impl<T: ToBytes + SigningIntent> GuardianSigned<T> {
     /// Create a new signed payload (used by enclave)
     /// Includes intent byte for domain separation to prevent cross-type signature attacks
     pub fn new(data: T, signing_key: &SigningKey, timestamp: SystemTime) -> Self {
-        let tuple = (T::INTENT, &data, timestamp);
+        let tuple = (T::INTENT, &data.to_bytes(), timestamp);
         let signing_payload = bcs::to_bytes(&tuple).expect("serialization should not fail");
         let signature = signing_key.sign(&signing_payload);
         Self {
@@ -295,7 +291,7 @@ impl<T: Serialize + SigningIntent> GuardianSigned<T> {
     /// Verify signature and extract payload
     /// Checks intent byte to ensure signature is for the correct type
     pub fn verify(self, pub_key: &VerificationKey) -> GuardianResult<T> {
-        let tuple = (T::INTENT, &self.data, self.timestamp);
+        let tuple = (T::INTENT, &self.data.to_bytes(), self.timestamp);
         let msg_bytes = bcs::to_bytes(&tuple).expect("serialization should not fail");
         pub_key
             .verify(&self.signature, &msg_bytes)

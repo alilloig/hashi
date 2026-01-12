@@ -1,7 +1,4 @@
 use anyhow::Result;
-use axum::routing::get;
-use axum::routing::post;
-use axum::Router;
 use bitcoin::secp256k1::Keypair;
 use bitcoin::Network;
 use bitcoin::XOnlyPublicKey;
@@ -11,7 +8,6 @@ use hashi_guardian_shared::crypto::Share;
 use hashi_guardian_shared::GuardianError::InternalError;
 use hashi_guardian_shared::GuardianError::InvalidInputs;
 use hashi_guardian_shared::*;
-use serde::Serialize;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -19,18 +15,19 @@ use std::time::Duration;
 use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
+use tonic::transport::Server;
 use tracing::info;
 
 mod getters;
 mod init;
+mod rpc;
 mod s3_logger;
 mod setup;
 
+use crate::rpc::GuardianGrpc;
 use crate::s3_logger::S3Logger;
-use getters::*;
-use init::operator_init;
-use init::provisioner_init;
-use setup::setup_new_key;
+use hashi::committee::Committee as HashiCommittee;
+use hashi::proto::guardian_service_server::GuardianServiceServer;
 
 /// Enclave's config & state
 pub struct Enclave {
@@ -62,7 +59,7 @@ pub struct EnclaveConfig {
 /// Mutable state that changes during operation
 pub struct EnclaveState {
     /// Hashi bls pk's
-    pub hashi_committee_info: RwLock<Arc<HashiCommitteeInfo>>,
+    pub hashi_committee: RwLock<Arc<HashiCommittee>>,
     /// Withdrawal-related state
     pub withdraw_state: Mutex<WithdrawalState>,
 }
@@ -107,27 +104,17 @@ async fn main() -> Result<()> {
     let encryption_keys = EncKeyPair::random(&mut rand::thread_rng());
     let enclave = Arc::new(Enclave::new(signing_keys, encryption_keys));
 
-    let app = Router::new()
-        // Get attestation
-        .route("/get_attestation", get(get_attestation))
-        // Init enclave (operator)
-        .route("/operator_init", post(operator_init));
-
-    // Conditionally add routes based on SETUP_MODE
-    let app = if setup_mode {
-        // Setup mode
-        app.route("/setup_new_key", post(setup_new_key))
-    } else {
-        // Normal mode
-        app.route("/provisioner_init", post(provisioner_init))
+    let svc = GuardianGrpc {
+        enclave,
+        setup_mode,
     };
 
-    let app = app.with_state(enclave);
+    let addr = "0.0.0.0:3000".parse()?;
+    info!("gRPC server listening on {}.", addr);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    info!("Server listening on {}.", listener.local_addr()?);
-    info!("Waiting for operator_init.");
-    axum::serve(listener, app.into_make_service())
+    Server::builder()
+        .add_service(GuardianServiceServer::new(svc))
+        .serve(addr)
         .await
         .map_err(|e| anyhow::anyhow!("Server error: {}", e))
 }
@@ -153,12 +140,11 @@ impl Enclave {
     // Construction & Initialization Status
     // ========================================================================
 
-    /// Create a new Enclave. Setting None to network leads to Regtest
     pub fn new(signing_keys: SigningKey, encryption_keys: EncKeyPair) -> Self {
         Enclave {
             config: EnclaveConfig::new(signing_keys, encryption_keys),
             state: EnclaveState {
-                hashi_committee_info: RwLock::new(Arc::new(HashiCommitteeInfo::default())),
+                hashi_committee: RwLock::new(Arc::new(HashiCommittee::new(vec![], 0))),
                 withdraw_state: Mutex::new(WithdrawalState::default()),
             },
             scratchpad: Scratchpad::default(),
@@ -216,7 +202,7 @@ impl Enclave {
         self.config.eph_keys.signing_keys.verification_key()
     }
 
-    pub fn sign<T: Serialize + SigningIntent>(&self, data: T) -> GuardianSigned<T> {
+    pub fn sign<T: ToBytes + SigningIntent>(&self, data: T) -> GuardianSigned<T> {
         let kp = self.signing_keypair();
         let timestamp = SystemTime::now();
         GuardianSigned::new(data, kp, timestamp)
@@ -295,6 +281,10 @@ impl Enclave {
         Ok(self.withdrawal_config()?.delayed_withdrawals_timeout)
     }
 
+    pub fn withdrawal_committee_threshold(&self) -> GuardianResult<u64> {
+        Ok(self.withdrawal_config()?.committee_threshold)
+    }
+
     // ========================================================================
     // S3 Logger
     // ========================================================================
@@ -346,13 +336,13 @@ impl Enclave {
 
     pub async fn set_state(
         &self,
-        committee: HashiCommitteeInfo,
+        committee: HashiCommittee,
         withdrawal_state: WithdrawalState,
     ) -> GuardianResult<()> {
         {
             let mut x = self
                 .state
-                .hashi_committee_info
+                .hashi_committee
                 .write()
                 .map_err(|_| InternalError("unable to acquire lock".into()))?;
             *x = Arc::new(committee);
@@ -367,10 +357,10 @@ impl Enclave {
     }
 
     /// Get the current hashi committee. The read lock is held very briefly only to clone the Arc.
-    pub fn get_committee(&self) -> Arc<HashiCommitteeInfo> {
+    pub fn get_committee(&self) -> Arc<HashiCommittee> {
         let x = &self
             .state
-            .hashi_committee_info
+            .hashi_committee
             .read()
             .expect("rwlock should never throw an error");
         // Note: read() or write() return an error if there's a panic while holding the write guard.
@@ -379,10 +369,10 @@ impl Enclave {
     }
 
     /// Update committee. Expected to be called sporadically, e.g., once a day or so.
-    pub async fn set_committee(&self, new_committee: HashiCommitteeInfo) {
+    pub async fn set_committee(&self, new_committee: HashiCommittee) {
         let mut state = self
             .state
-            .hashi_committee_info
+            .hashi_committee
             .write()
             .expect("rwlock should never throw an error");
         *state = Arc::new(new_committee);
