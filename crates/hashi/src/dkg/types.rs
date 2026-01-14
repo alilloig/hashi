@@ -8,14 +8,18 @@ use fastcrypto_tbls::threshold_schnorr::avss;
 use fastcrypto_tbls::threshold_schnorr::complaint;
 use fastcrypto_tbls::types::ShareIndex;
 use hashi_types::committee::BLS12381Signature;
+use hashi_types::committee::Committee;
 use hashi_types::committee::SignedMessage;
+use hashi_types::move_types::CertifiedMessage;
+use hashi_types::move_types::DkgDealerMessageHashV1;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use sui_sdk_types::Address;
+use sui_sdk_types::Digest;
 
 pub type EncryptionGroupElement = fastcrypto::groups::ristretto255::RistrettoPoint;
-pub type MessageHash = [u8; 32];
+pub type MessageHash = Digest;
 
 // Domain separation constants for RandomOracle
 const DOMAIN_HASHI: &str =
@@ -229,20 +233,119 @@ pub struct DkgDealerMessageHash {
     pub message_hash: MessageHash,
 }
 
+impl DkgDealerMessageHash {
+    pub fn from_onchain_cert(
+        cert: &CertifiedMessage<DkgDealerMessageHashV1>,
+        epoch: u64,
+        committee: &Committee,
+        threshold: u64,
+    ) -> Result<DkgCertificate, DkgError> {
+        let hash_bytes: [u8; 32] =
+            cert.message
+                .message_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| DkgError::InvalidMessage {
+                    sender: cert.message.dealer_address,
+                    reason: "invalid message_hash length".into(),
+                })?;
+
+        let message = Self {
+            dealer_address: cert.message.dealer_address,
+            message_hash: hash_bytes.into(),
+        };
+        SignedMessage::try_from_parts(
+            epoch,
+            message,
+            &cert.signature.signature,
+            &cert.signature.signers_bitmap,
+            committee,
+            threshold,
+        )
+        .map_err(|e| DkgError::InvalidCertificate(e.to_string()))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RotationDealerMessagesHash {
     pub dealer_address: Address,
     pub messages_hash: MessageHash,
 }
 
+pub type DkgCertificate = SignedMessage<DkgDealerMessageHash>;
+pub type RotationCertificate = SignedMessage<RotationDealerMessagesHash>;
+
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum MpcMessageV1 {
-    Dkg(DkgDealerMessageHash),
-    Rotation(RotationDealerMessagesHash),
+#[derive(Clone, Debug)]
+pub enum CertificateV1 {
+    Dkg(DkgCertificate),
+    Rotation(RotationCertificate),
 }
 
-pub type Certificate = SignedMessage<MpcMessageV1>;
+impl CertificateV1 {
+    pub fn epoch(&self) -> u64 {
+        match self {
+            CertificateV1::Dkg(cert) => cert.epoch(),
+            CertificateV1::Rotation(cert) => cert.epoch(),
+        }
+    }
+
+    pub fn signature_bytes(&self) -> &[u8] {
+        match self {
+            CertificateV1::Dkg(cert) => cert.signature_bytes(),
+            CertificateV1::Rotation(cert) => cert.signature_bytes(),
+        }
+    }
+
+    pub fn signers_bitmap_bytes(&self) -> &[u8] {
+        match self {
+            CertificateV1::Dkg(cert) => cert.signers_bitmap_bytes(),
+            CertificateV1::Rotation(cert) => cert.signers_bitmap_bytes(),
+        }
+    }
+
+    pub fn signers(
+        &self,
+        committee: &Committee,
+    ) -> Result<Vec<Address>, sui_crypto::SignatureError> {
+        match self {
+            CertificateV1::Dkg(cert) => cert.signers(committee),
+            CertificateV1::Rotation(cert) => cert.signers(committee),
+        }
+    }
+
+    pub fn weight(&self, committee: &Committee) -> Result<u64, sui_crypto::SignatureError> {
+        match self {
+            CertificateV1::Dkg(cert) => cert.weight(committee),
+            CertificateV1::Rotation(cert) => cert.weight(committee),
+        }
+    }
+
+    pub fn is_signer(
+        &self,
+        address: &Address,
+        committee: &Committee,
+    ) -> Result<bool, sui_crypto::SignatureError> {
+        match self {
+            CertificateV1::Dkg(cert) => cert.is_signer(address, committee),
+            CertificateV1::Rotation(cert) => cert.is_signer(address, committee),
+        }
+    }
+
+    pub fn dkg_message_hash(&self) -> Option<&DkgDealerMessageHash> {
+        match self {
+            CertificateV1::Dkg(cert) => Some(cert.message()),
+            CertificateV1::Rotation(_) => None,
+        }
+    }
+
+    pub fn rotation_message_hash(&self) -> Option<&RotationDealerMessagesHash> {
+        match self {
+            CertificateV1::Dkg(_) => None,
+            CertificateV1::Rotation(cert) => Some(cert.message()),
+        }
+    }
+}
 
 pub type DkgResult<T> = Result<T, DkgError>;
 
@@ -304,11 +407,13 @@ impl From<crate::communication::ChannelError> for DkgError {
 mod tests {
     use super::*;
     use fastcrypto_tbls::nodes::Node;
+    use hashi_types::committee::Bls12381PrivateKey;
+    use hashi_types::committee::BlsSignatureAggregator;
+    use hashi_types::committee::CommitteeMember;
     use hashi_types::committee::EncryptionPrivateKey;
     use hashi_types::committee::EncryptionPublicKey;
+    use hashi_types::move_types::CommitteeSignature as MoveCommitteeSignature;
     use std::num::NonZeroU16;
-
-    const EXPECT_DKG_MESSAGE: &str = "expected Dkg message";
 
     impl RotationMessages {
         pub fn insert(&mut self, share_index: ShareIndex, message: avss::Message) {
@@ -317,22 +422,6 @@ mod tests {
 
         pub fn keys(&self) -> impl Iterator<Item = &ShareIndex> {
             self.messages.keys()
-        }
-    }
-
-    impl MpcMessageV1 {
-        pub fn as_dkg_message(&self) -> &DkgDealerMessageHash {
-            match self {
-                MpcMessageV1::Dkg(msg) => msg,
-                MpcMessageV1::Rotation(_) => panic!("{}", EXPECT_DKG_MESSAGE),
-            }
-        }
-
-        pub fn as_mut_dkg_message(&mut self) -> &mut DkgDealerMessageHash {
-            match self {
-                MpcMessageV1::Dkg(msg) => msg,
-                MpcMessageV1::Rotation(_) => panic!("{}", EXPECT_DKG_MESSAGE),
-            }
         }
     }
 
@@ -501,5 +590,120 @@ mod tests {
         let session_d1_s1 = sid.rotation_session_id(&dealer, share1);
         let session_d1_s2 = sid.rotation_session_id(&dealer, share2);
         assert_ne!(session_d1_s1, session_d1_s2);
+    }
+
+    #[test]
+    fn test_from_onchain_cert_success() {
+        let mut rng = rand::thread_rng();
+        let epoch = 100u64;
+        let threshold = 2u64;
+
+        // Create committee with 3 members
+        let signing_keys: Vec<_> = (0..3)
+            .map(|_| Bls12381PrivateKey::generate(&mut rng))
+            .collect();
+        let encryption_keys: Vec<_> = (0..3)
+            .map(|_| EncryptionPrivateKey::new(&mut rng))
+            .collect();
+        let members: Vec<_> = (0..3)
+            .map(|i| {
+                CommitteeMember::new(
+                    Address::new([i as u8; 32]),
+                    signing_keys[i].public_key(),
+                    EncryptionPublicKey::from_private_key(&encryption_keys[i]),
+                    1,
+                )
+            })
+            .collect();
+        let committee = Committee::new(members, epoch);
+
+        // Create a DkgDealerMessageHash
+        let dealer_address = Address::new([0u8; 32]);
+        let message_hash: [u8; 32] = [42u8; 32];
+        let dkg_message = DkgDealerMessageHash {
+            dealer_address,
+            message_hash: message_hash.into(),
+        };
+
+        // Sign with committee members to create a valid certificate
+        let mut aggregator = BlsSignatureAggregator::new(&committee, dkg_message.clone());
+        for (i, key) in signing_keys.iter().enumerate() {
+            let addr = Address::new([i as u8; 32]);
+            let sig = key.sign(epoch, addr, &dkg_message);
+            aggregator.add_signature(sig).unwrap();
+        }
+        let signed_message = aggregator.finish().unwrap();
+
+        // Convert to on-chain format
+        let onchain_cert = CertifiedMessage {
+            message: DkgDealerMessageHashV1 {
+                dealer_address,
+                message_hash: message_hash.to_vec(),
+            },
+            signature: MoveCommitteeSignature {
+                epoch,
+                signature: signed_message.signature_bytes().to_vec(),
+                signers_bitmap: signed_message.signers_bitmap_bytes().to_vec(),
+            },
+            stake_support: 3,
+        };
+
+        // Parse back using from_onchain_cert
+        let result =
+            DkgDealerMessageHash::from_onchain_cert(&onchain_cert, epoch, &committee, threshold);
+        assert!(
+            result.is_ok(),
+            "Should parse valid certificate: {:?}",
+            result.err()
+        );
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.message().dealer_address, dealer_address);
+        assert_eq!(
+            <MessageHash as AsRef<[u8; 32]>>::as_ref(&parsed.message().message_hash),
+            &message_hash
+        );
+    }
+
+    #[test]
+    fn test_from_onchain_cert_invalid_hash_length() {
+        let mut rng = rand::thread_rng();
+        let epoch = 100u64;
+        let threshold = 1u64;
+
+        // Create minimal committee
+        let signing_key = Bls12381PrivateKey::generate(&mut rng);
+        let encryption_key = EncryptionPrivateKey::new(&mut rng);
+        let member = CommitteeMember::new(
+            Address::new([0u8; 32]),
+            signing_key.public_key(),
+            EncryptionPublicKey::from_private_key(&encryption_key),
+            1,
+        );
+        let committee = Committee::new(vec![member], epoch);
+
+        // Create certificate with invalid hash length (not 32 bytes)
+        let onchain_cert = CertifiedMessage {
+            message: DkgDealerMessageHashV1 {
+                dealer_address: Address::new([0u8; 32]),
+                message_hash: vec![1, 2, 3], // Invalid: only 3 bytes
+            },
+            signature: MoveCommitteeSignature {
+                epoch,
+                signature: vec![],
+                signers_bitmap: vec![],
+            },
+            stake_support: 0,
+        };
+
+        let result =
+            DkgDealerMessageHash::from_onchain_cert(&onchain_cert, epoch, &committee, threshold);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid message_hash length"),
+            "Error should mention invalid hash length: {}",
+            err
+        );
     }
 }

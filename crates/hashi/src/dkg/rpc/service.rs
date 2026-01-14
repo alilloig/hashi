@@ -1,4 +1,5 @@
 use crate::dkg::types;
+use crate::dkg::types::DkgError;
 use crate::grpc::HttpService;
 use hashi_types::proto::ComplainRequest;
 use hashi_types::proto::ComplainResponse;
@@ -30,11 +31,12 @@ impl DkgService for HttpService {
         let external_request = request.into_inner();
         let internal_request = types::SendMessageRequest::try_from(&external_request)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let mut dkg_manager = self.dkg_manager().lock().unwrap();
-        validate_epoch(dkg_manager.dkg_config.epoch, external_request.epoch)?;
-        let response = dkg_manager
-            .handle_send_message_request(sender, &internal_request)
-            .map_err(dkg_error_to_status)?;
+        let response = {
+            let mut mgr = self.dkg_manager().lock().unwrap();
+            validate_epoch(mgr.dkg_config.epoch, external_request.epoch)?;
+            mgr.handle_send_message_request(sender, &internal_request)
+                .map_err(dkg_error_to_status)?
+        };
         Ok(tonic::Response::new(SendMessageResponse::from(&response)))
     }
 
@@ -47,11 +49,12 @@ impl DkgService for HttpService {
         let external_request = request.into_inner();
         let internal_request = types::RetrieveMessageRequest::try_from(&external_request)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let dkg_manager = self.dkg_manager().lock().unwrap();
-        validate_epoch(dkg_manager.dkg_config.epoch, external_request.epoch)?;
-        let response = dkg_manager
-            .handle_retrieve_message_request(&internal_request)
-            .map_err(dkg_error_to_status)?;
+        let response = {
+            let mgr = self.dkg_manager().lock().unwrap();
+            validate_epoch(mgr.dkg_config.epoch, external_request.epoch)?;
+            mgr.handle_retrieve_message_request(&internal_request)
+                .map_err(dkg_error_to_status)?
+        };
         Ok(tonic::Response::new(RetrieveMessageResponse::from(
             &response,
         )))
@@ -66,11 +69,12 @@ impl DkgService for HttpService {
         let external_request = request.into_inner();
         let internal_request = types::ComplainRequest::try_from(&external_request)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let mut dkg_manager = self.dkg_manager().lock().unwrap();
-        validate_epoch(dkg_manager.dkg_config.epoch, external_request.epoch)?;
-        let response = dkg_manager
-            .handle_complain_request(&internal_request)
-            .map_err(dkg_error_to_status)?;
+        let response = {
+            let mut mgr = self.dkg_manager().lock().unwrap();
+            validate_epoch(mgr.dkg_config.epoch, external_request.epoch)?;
+            mgr.handle_complain_request(&internal_request)
+                .map_err(dkg_error_to_status)?
+        };
         Ok(tonic::Response::new(ComplainResponse::from(&response)))
     }
 }
@@ -97,22 +101,14 @@ impl KeyRotationService for HttpService {
         ))
     }
 
-    #[tracing::instrument(skip(self, request))]
+    #[tracing::instrument(skip(self, _request))]
     async fn get_public_dkg_output(
         &self,
-        request: tonic::Request<GetPublicDkgOutputRequest>,
+        _request: tonic::Request<GetPublicDkgOutputRequest>,
     ) -> Result<tonic::Response<GetPublicDkgOutputResponse>, Status> {
-        authenticate_caller(&request)?;
-        let external_request = request.into_inner();
-        let internal_request = types::GetPublicDkgOutputRequest::try_from(&external_request)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let dkg_manager = self.dkg_manager().lock().unwrap();
-        let response = dkg_manager
-            .handle_get_public_dkg_output_request(&internal_request)
-            .map_err(dkg_error_to_status)?;
-        Ok(tonic::Response::new(GetPublicDkgOutputResponse::from(
-            &response,
-        )))
+        Err(Status::unimplemented(
+            "get_public_dkg_output not yet implemented",
+        ))
     }
 
     #[tracing::instrument(skip(self, _request))]
@@ -145,7 +141,7 @@ fn validate_epoch(expected: u64, request_epoch: Option<u64>) -> Result<(), Statu
     Ok(())
 }
 
-fn dkg_error_to_status(err: types::DkgError) -> Status {
+fn dkg_error_to_status(err: DkgError) -> Status {
     use types::DkgError::*;
     match &err {
         InvalidThreshold(_) | InvalidMessage { .. } | InvalidCertificate(_) => {

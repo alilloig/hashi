@@ -7,10 +7,10 @@ use crate::communication::ChannelResult;
 use crate::communication::OrderedBroadcastChannel;
 use crate::communication::P2PChannel;
 use crate::communication::with_timeout_and_retry;
-use crate::dkg::types::Certificate;
+use crate::dkg::types::CertificateV1;
+use crate::dkg::types::DkgCertificate;
 use crate::dkg::types::DkgDealerMessageHash;
-use crate::dkg::types::MpcMessageV1::Dkg;
-use crate::dkg::types::MpcMessageV1::Rotation;
+use crate::dkg::types::RotationCertificate;
 use crate::dkg::types::RotationDealerMessagesHash;
 use crate::onchain::types::CommitteeSet;
 use crate::storage::PublicMessagesStore;
@@ -34,10 +34,15 @@ use futures::stream::StreamExt;
 use hashi_types::committee::Bls12381PrivateKey;
 use hashi_types::committee::BlsSignatureAggregator;
 use hashi_types::committee::Committee;
+use hashi_types::committee::MemberSignature;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use sui_sdk_types::Address;
 pub use types::ComplainRequest;
 pub use types::ComplainResponse;
@@ -67,6 +72,18 @@ pub use types::SessionId;
 const ERR_PUBLISH_CERT_FAILED: &str = "Failed to publish certificate";
 const EXPECT_THRESHOLD_VALIDATED: &str = "threshold already validated";
 const EXPECT_SERIALIZATION_SUCCESS: &str = "serialization should always succeed";
+
+/// Data needed to execute the dealer P2P operations (async, no lock needed).
+pub struct DealerFlowData {
+    pub message: avss::Message,
+    pub request: SendMessageRequest,
+    pub recipients: Vec<Address>,
+    pub dkg_message_hash: DkgDealerMessageHash,
+    pub my_address: Address,
+    pub my_signature: MemberSignature,
+    pub required_weight: u16,
+    pub committee: Committee,
+}
 
 struct RotationComplainContext {
     request: RotationComplainRequest,
@@ -105,6 +122,8 @@ pub struct DkgManager {
 }
 
 // TODO: Factor out common code between DKG and key rotation.
+// TODO: Consider wrapping crypto operations with `tokio::task::spawn_blocking`
+// since they are CPU-heavy and can block the async runtime.
 impl DkgManager {
     pub fn new(
         address: Address,
@@ -128,12 +147,13 @@ impl DkgManager {
                 weight: member.weight() as u16,
             });
         }
-        // TODO: Use `Nodes::new_reduce()`
-        let nodes = Nodes::new(nodes_vec).map_err(|e| DkgError::CryptoError(e.to_string()))?;
         // TODO: Pass t and f as arguments instead of computing them
+        let original_total_weight: u16 = nodes_vec.iter().map(|n| n.weight).sum();
+        let original_threshold = (original_total_weight - 1) / 3 + 1;
+        let (nodes, threshold) = Nodes::new_reduced(nodes_vec, original_threshold, 0, 1)
+            .map_err(|e| DkgError::CryptoError(e.to_string()))?;
         let total_weight = nodes.total_weight();
-        let max_faulty = (total_weight - 1) / 3;
-        let threshold = max_faulty + 1;
+        let max_faulty = ((total_weight - threshold) / 2).min(threshold.saturating_sub(1));
         let dkg_config = DkgConfig::new(committee_set.epoch(), nodes, threshold, max_faulty)?;
         let party_id = committee
             .index_of(&address)
@@ -406,28 +426,27 @@ impl DkgManager {
 
     // TODO: Consider making dealer and party flows concurrent
     pub async fn run(
-        &mut self,
+        dkg_manager: &Arc<Mutex<Self>>,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
-        rng: &mut impl fastcrypto::traits::AllowedRng,
+        tob_channel: &mut impl OrderedBroadcastChannel<CertificateV1>,
     ) -> DkgResult<DkgOutput> {
-        if ordered_broadcast_channel.existing_certificate_weight()
-            < self.dkg_config.threshold as u32
-            && let Err(e) = self
-                .run_as_dealer(p2p_channel, ordered_broadcast_channel, rng)
-                .await
+        let threshold = {
+            let mgr = dkg_manager.lock().unwrap();
+            mgr.dkg_config.threshold
+        };
+        if tob_channel.existing_certificate_weight() < threshold as u32
+            && let Err(e) = Self::run_as_dealer(dkg_manager, p2p_channel, tob_channel).await
         {
             tracing::error!("Dealer phase failed: {}. Continuing as party only.", e);
         }
-        self.run_as_party(p2p_channel, ordered_broadcast_channel)
-            .await
+        Self::run_as_party(dkg_manager, p2p_channel, tob_channel).await
     }
 
     pub async fn run_key_rotation(
         &mut self,
-        dkg_certificates: &[Certificate],
+        dkg_certificates: &[CertificateV1],
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<CertificateV1>,
         rng: &mut impl fastcrypto::traits::AllowedRng,
     ) -> DkgResult<DkgOutput> {
         let (previous, is_member_of_previous_committee) = self
@@ -451,45 +470,26 @@ impl DkgManager {
     }
 
     async fn run_as_dealer(
-        &mut self,
+        dkg_manager: &Arc<Mutex<Self>>,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
-        rng: &mut impl fastcrypto::traits::AllowedRng,
+        tob_channel: &mut impl OrderedBroadcastChannel<CertificateV1>,
     ) -> DkgResult<()> {
         // TODO(Optimization): Skip dealer phase if certificate is already on TOB
-        let message = match self.dealer_messages.get(&self.address) {
-            Some(msg) => msg.clone(),
-            None => {
-                let msg = self.create_dealer_message(rng);
-                self.store_message(self.address, &msg)?;
-                msg
-            }
+        let mut rng = StdRng::from_entropy();
+        let dealer_data = {
+            let mut mgr = dkg_manager.lock().unwrap();
+            mgr.prepare_dealer_flow(&mut rng)?
         };
-        let my_signature = self
-            .try_sign_message(self.address, &message)
-            .expect("own message should always be valid");
-        let message_hash = compute_message_hash(&message);
-        let mut aggregator = BlsSignatureAggregator::new(
-            &self.committee,
-            Dkg(DkgDealerMessageHash {
-                dealer_address: self.address,
-                message_hash,
-            }),
-        );
+        let mut aggregator =
+            BlsSignatureAggregator::new(&dealer_data.committee, dealer_data.dkg_message_hash);
         aggregator
-            .add_signature_from(self.address, my_signature)
+            .add_signature(dealer_data.my_signature)
             .expect("first signature should always be valid");
-        let recipients: Vec<_> = self
-            .committee
-            .members()
-            .iter()
-            .map(|m| m.validator_address())
-            .filter(|addr| *addr != self.address)
-            .collect();
-        let request = SendMessageRequest { message };
-        let results = send_to_many(&recipients, request, |addr, req| async move {
-            p2p_channel.send_dkg_message(&addr, &req).await
-        })
+        let results = send_to_many(
+            &dealer_data.recipients,
+            dealer_data.request,
+            |addr, req| async move { p2p_channel.send_dkg_message(&addr, &req).await },
+        )
         .await;
         for (addr, result) in results {
             match result {
@@ -501,13 +501,13 @@ impl DkgManager {
                 Err(e) => tracing::info!("Failed to send message to {:?}: {}", addr, e),
             }
         }
-        let required_weight = self.dkg_config.threshold + self.dkg_config.max_faulty;
-        if aggregator.weight() >= required_weight as u64 {
-            let cert = aggregator
+        if aggregator.weight() >= dealer_data.required_weight as u64 {
+            let dkg_cert = aggregator
                 .finish()
                 .expect("signatures should always be valid");
+            let cert = CertificateV1::Dkg(dkg_cert);
             // TODO: do not fail in case my certificate is already published
-            with_timeout_and_retry(|| ordered_broadcast_channel.publish(cert.clone()))
+            with_timeout_and_retry(|| tob_channel.publish(cert.clone()))
                 .await
                 .map_err(|e| {
                     DkgError::BroadcastError(format!("{}: {}", ERR_PUBLISH_CERT_FAILED, e))
@@ -517,83 +517,109 @@ impl DkgManager {
     }
 
     async fn run_as_party(
-        &mut self,
+        dkg_manager: &Arc<Mutex<Self>>,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
+        tob_channel: &mut impl OrderedBroadcastChannel<CertificateV1>,
     ) -> DkgResult<DkgOutput> {
+        let threshold = {
+            let mgr = dkg_manager.lock().unwrap();
+            mgr.dkg_config.threshold
+        };
         let mut certified_dealers = HashSet::new();
         let mut dealer_weight_sum = 0u32;
         loop {
-            if dealer_weight_sum >= self.dkg_config.threshold as u32 {
+            if dealer_weight_sum >= threshold as u32 {
                 break;
             }
-            let cert = ordered_broadcast_channel
+            let cert = tob_channel
                 .receive()
                 .await
                 .map_err(|e| DkgError::BroadcastError(e.to_string()))?;
-            match cert.message() {
-                Dkg(message) => {
-                    let dealer = message.dealer_address;
-                    if certified_dealers.contains(&dealer) {
-                        continue;
-                    }
-                    if let Err(e) = self.committee.verify_signature(&cert) {
-                        tracing::info!("Invalid certificate signature from {:?}: {}", &dealer, e);
-                        continue;
-                    }
-                    let needs_retrieval = match self.dealer_messages.get(&dealer) {
-                        None => true,
-                        Some(stored_msg) => {
-                            compute_message_hash(stored_msg) != message.message_hash
-                        }
-                    };
-                    if needs_retrieval {
-                        tracing::info!(
-                            "Certificate from dealer {:?} received but message missing or hash mismatch, retrieving from signers",
-                            &dealer
-                        );
-                        self.retrieve_dealer_message(message, &cert, p2p_channel)
-                            .await
-                            .map_err(|e| {
-                                tracing::error!(
-                                    "Failed to retrieve message from any signer for dealer {:?}: {}. Certificate exists but message unavailable from all signers.",
-                                    &dealer,
-                                    e
-                                );
-                                e
-                            })?;
-                    }
-                    if !self.dealer_outputs.contains_key(&dealer)
-                        && !self.complaints_to_process.contains_key(&dealer)
-                    {
-                        self.process_certified_dealer_message(dealer)?;
-                    }
-                    if self.complaints_to_process.contains_key(&dealer) {
-                        self.recover_shares_via_complaint(
-                            &dealer,
-                            cert.signers(&self.committee)
-                                .expect("certificate verified above"),
-                            p2p_channel,
-                        )
-                        .await?;
-                    }
-                    let dealer_weight = self.committee.weight_of(&dealer).map_err(|_| {
-                        DkgError::ProtocolFailed("Missing dealer weight".parse().unwrap())
-                    })?;
-                    dealer_weight_sum += dealer_weight as u32;
-                    certified_dealers.insert(dealer);
-                }
-                Rotation(_) => continue,
+            let CertificateV1::Dkg(dkg_cert) = cert else {
+                continue;
+            };
+            let message = dkg_cert.message();
+            let dealer = message.dealer_address;
+            if certified_dealers.contains(&dealer) {
+                continue;
             }
+            {
+                let mgr = dkg_manager.lock().unwrap();
+                if let Err(e) = mgr.committee.verify_signature(&dkg_cert) {
+                    tracing::info!("Invalid certificate signature from {:?}: {}", &dealer, e);
+                    continue;
+                }
+            }
+            let needs_retrieval = {
+                let mgr = dkg_manager.lock().unwrap();
+                match mgr.dealer_messages.get(&dealer) {
+                    None => true,
+                    Some(stored_msg) => compute_message_hash(stored_msg) != message.message_hash,
+                }
+            };
+            if needs_retrieval {
+                tracing::info!(
+                    "Certificate from dealer {:?} received but message missing or hash mismatch, retrieving from signers",
+                    &dealer
+                );
+                Self::retrieve_dealer_message(dkg_manager, message, &dkg_cert, p2p_channel)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to retrieve message from any signer for dealer {:?}: {}. Certificate exists but message unavailable from all signers.",
+                            &dealer,
+                            e
+                        );
+                        e
+                    })?;
+            }
+            {
+                let mut mgr = dkg_manager.lock().unwrap();
+                if !mgr.dealer_outputs.contains_key(&dealer)
+                    && !mgr.complaints_to_process.contains_key(&dealer)
+                {
+                    mgr.process_certified_dealer_message(dealer)?;
+                }
+            }
+            let has_complaint = {
+                let mgr = dkg_manager.lock().unwrap();
+                mgr.complaints_to_process.contains_key(&dealer)
+            };
+            if has_complaint {
+                let signers = {
+                    let mgr = dkg_manager.lock().unwrap();
+                    dkg_cert
+                        .signers(&mgr.committee)
+                        .expect("certificate verified above")
+                };
+                Self::recover_shares_via_complaint(dkg_manager, &dealer, signers, p2p_channel)
+                    .await?;
+            }
+            let dealer_weight = {
+                let mgr = dkg_manager.lock().unwrap();
+                if !mgr.dealer_outputs.contains_key(&dealer) {
+                    tracing::warn!("No dealer output for {:?} after processing", dealer);
+                    continue;
+                }
+                mgr.committee
+                    .weight_of(&dealer)
+                    .map_err(|_| DkgError::ProtocolFailed("Missing dealer weight".to_string()))?
+            };
+            dealer_weight_sum += dealer_weight as u32;
+            certified_dealers.insert(dealer);
         }
-        self.complete_dkg(certified_dealers.into_iter())
+        let output = {
+            let mgr = dkg_manager.lock().unwrap();
+            mgr.complete_dkg(mgr.dealer_outputs.keys().cloned())?
+        };
+        Ok(output)
     }
 
     async fn run_key_rotation_as_dealer(
         &mut self,
         previous: &DkgOutput,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<CertificateV1>,
         rng: &mut impl fastcrypto::traits::AllowedRng,
     ) -> DkgResult<()> {
         let rotation_messages = self.create_rotation_messages(previous, rng);
@@ -603,15 +629,14 @@ impl DkgManager {
             .try_sign_rotation_messages(previous, self.address, &rotation_messages)
             .expect("own rotation messages should always be valid");
         let messages_hash = compute_rotation_messages_hash(&rotation_messages);
-        let mut aggregator = BlsSignatureAggregator::new(
-            &self.committee,
-            Rotation(RotationDealerMessagesHash {
-                dealer_address: self.address,
-                messages_hash,
-            }),
-        );
+        let rotation_message = RotationDealerMessagesHash {
+            dealer_address: self.address,
+            messages_hash,
+        };
+        let my_member_sig = MemberSignature::new(self.dkg_config.epoch, self.address, my_signature);
+        let mut aggregator = BlsSignatureAggregator::new(&self.committee, rotation_message);
         aggregator
-            .add_signature_from(self.address, my_signature)
+            .add_signature(my_member_sig)
             .expect("first signature should always be valid");
         let recipients: Vec<_> = self
             .committee
@@ -642,9 +667,10 @@ impl DkgManager {
         }
         let required_weight = self.dkg_config.threshold + self.dkg_config.max_faulty;
         if aggregator.weight() >= required_weight as u64 {
-            let cert = aggregator
+            let rotation_cert = aggregator
                 .finish()
                 .expect("signatures should always be valid");
+            let cert = CertificateV1::Rotation(rotation_cert);
             with_timeout_and_retry(|| ordered_broadcast_channel.publish(cert.clone()))
                 .await
                 .map_err(|e| {
@@ -658,7 +684,7 @@ impl DkgManager {
         &mut self,
         previous: &DkgOutput,
         p2p_channel: &impl P2PChannel,
-        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<Certificate>,
+        ordered_broadcast_channel: &mut impl OrderedBroadcastChannel<CertificateV1>,
     ) -> DkgResult<DkgOutput> {
         let mut certified_share_indices: Vec<_> = self.rotation_outputs.keys().copied().collect();
         let mut certified_dealers = HashSet::new();
@@ -670,83 +696,79 @@ impl DkgManager {
                 .receive()
                 .await
                 .map_err(|e| DkgError::BroadcastError(e.to_string()))?;
-            match cert.message() {
-                Rotation(message) => {
-                    let dealer = message.dealer_address;
-                    if certified_dealers.contains(&dealer) {
-                        continue;
+            let CertificateV1::Rotation(rotation_cert) = cert else {
+                continue;
+            };
+            let message = rotation_cert.message();
+            let dealer = message.dealer_address;
+            if certified_dealers.contains(&dealer) {
+                continue;
+            }
+            if let Err(e) = self.committee.verify_signature(&rotation_cert) {
+                tracing::info!(
+                    "Invalid rotation certificate signature from {:?}: {}",
+                    &dealer,
+                    e
+                );
+                continue;
+            }
+            let previous_nodes = self.previous_nodes.as_ref().ok_or_else(|| {
+                DkgError::InvalidConfig("Key rotation requires previous nodes".into())
+            })?;
+            let previous_committee = self.previous_committee.as_ref().ok_or_else(|| {
+                DkgError::InvalidConfig("Key rotation requires previous committee".into())
+            })?;
+            let dealer_party_id =
+                previous_committee
+                    .index_of(&dealer)
+                    .ok_or_else(|| DkgError::InvalidMessage {
+                        sender: dealer,
+                        reason: "Dealer not in previous committee".into(),
+                    })? as u16;
+            let dealer_share_indices =
+                previous_nodes.share_ids_of(dealer_party_id).map_err(|_| {
+                    DkgError::InvalidMessage {
+                        sender: dealer,
+                        reason: "Dealer has no shares in previous committee".into(),
                     }
-                    if let Err(e) = self.committee.verify_signature(&cert) {
-                        tracing::info!(
-                            "Invalid rotation certificate signature from {:?}: {}",
-                            &dealer,
+                })?;
+            let needs_retrieval = match self.rotation_dealer_messages.get(&dealer) {
+                None => true,
+                Some(stored_msgs) => {
+                    compute_rotation_messages_hash(stored_msgs) != message.messages_hash
+                }
+            };
+            if needs_retrieval {
+                tracing::info!(
+                    "Rotation messages from dealer {:?} not available or hash mismatch, retrieving from signers",
+                    dealer
+                );
+                self.retrieve_rotation_messages(message, &rotation_cert, p2p_channel)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to retrieve rotation messages for dealer {:?}: {}",
+                            dealer,
                             e
                         );
-                        continue;
-                    }
-                    let previous_nodes = self.previous_nodes.as_ref().ok_or_else(|| {
-                        DkgError::InvalidConfig("Key rotation requires previous nodes".into())
+                        e
                     })?;
-                    let previous_committee = self.previous_committee.as_ref().ok_or_else(|| {
-                        DkgError::InvalidConfig("Key rotation requires previous committee".into())
-                    })?;
-                    let dealer_party_id = previous_committee.index_of(&dealer).ok_or_else(|| {
-                        DkgError::InvalidMessage {
-                            sender: dealer,
-                            reason: "Dealer not in previous committee".into(),
-                        }
-                    })? as u16;
-                    let dealer_share_indices = previous_nodes
-                        .share_ids_of(dealer_party_id)
-                        .map_err(|_| DkgError::InvalidMessage {
-                            sender: dealer,
-                            reason: "Dealer has no shares in previous committee".into(),
-                        })?;
-                    let needs_retrieval = match self.rotation_dealer_messages.get(&dealer) {
-                        None => true,
-                        Some(stored_msgs) => {
-                            compute_rotation_messages_hash(stored_msgs) != message.messages_hash
-                        }
-                    };
-                    if needs_retrieval {
-                        tracing::info!(
-                            "Rotation messages from dealer {:?} not available or hash mismatch, retrieving from signers",
-                            dealer
-                        );
-                        self.retrieve_rotation_messages(message, &cert, p2p_channel)
-                            .await
-                            .map_err(|e| {
-                                tracing::error!(
-                                    "Failed to retrieve rotation messages for dealer {:?}: {}",
-                                    dealer,
-                                    e
-                                );
-                                e
-                            })?;
-                    }
-                    if dealer_share_indices.iter().any(|idx| {
-                        !self.rotation_outputs.contains_key(idx)
-                            && !self
-                                .rotation_complaints_to_process
-                                .contains_key(&(dealer, *idx))
-                    }) {
-                        self.process_certified_rotation_message(&dealer, previous)?;
-                    }
-                    let signers = cert
-                        .signers(&self.committee)
-                        .expect("certificate verified above");
-                    self.recover_rotation_shares_via_complaints(
-                        &dealer,
-                        previous,
-                        signers,
-                        p2p_channel,
-                    )
-                    .await?;
-                    certified_share_indices.extend(dealer_share_indices);
-                    certified_dealers.insert(dealer);
-                }
-                Dkg(_) => continue,
             }
+            if dealer_share_indices.iter().any(|idx| {
+                !self.rotation_outputs.contains_key(idx)
+                    && !self
+                        .rotation_complaints_to_process
+                        .contains_key(&(dealer, *idx))
+            }) {
+                self.process_certified_rotation_message(&dealer, previous)?;
+            }
+            let signers = rotation_cert
+                .signers(&self.committee)
+                .expect("certificate verified above");
+            self.recover_rotation_shares_via_complaints(&dealer, previous, signers, p2p_channel)
+                .await?;
+            certified_share_indices.extend(dealer_share_indices);
+            certified_dealers.insert(dealer);
         }
         self.complete_key_rotation(previous, &certified_share_indices)
     }
@@ -789,18 +811,18 @@ impl DkgManager {
             None, // commitment: None for initial DKG
             self.encryption_key.clone(),
         );
-        match receiver.process_message(message)? {
+        let result = receiver.process_message(message)?;
+        match result {
             avss::ProcessedMessage::Valid(output) => {
                 self.dealer_outputs.insert(dealer, output);
                 let message_hash = compute_message_hash(message);
-                let signature = self.signing_key.sign(
-                    self.dkg_config.epoch,
-                    self.address,
-                    &Dkg(DkgDealerMessageHash {
-                        dealer_address: dealer,
-                        message_hash,
-                    }),
-                );
+                let dkg_message = DkgDealerMessageHash {
+                    dealer_address: dealer,
+                    message_hash,
+                };
+                let signature =
+                    self.signing_key
+                        .sign(self.dkg_config.epoch, self.address, &dkg_message);
                 Ok(signature.signature().clone())
             }
             avss::ProcessedMessage::Complaint(_) => Err(DkgError::InvalidMessage {
@@ -917,64 +939,113 @@ impl DkgManager {
     }
 
     async fn retrieve_dealer_message(
-        &mut self,
+        dkg_manager: &Arc<Mutex<Self>>,
         message: &DkgDealerMessageHash,
-        certificate: &Certificate,
+        certificate: &DkgCertificate,
         p2p_channel: &impl P2PChannel,
     ) -> DkgResult<()> {
-        let request = RetrieveMessageRequest {
-            dealer: message.dealer_address,
+        let (request, signers, self_address) = {
+            let mgr = dkg_manager.lock().unwrap();
+            if certificate
+                .is_signer(&mgr.address, &mgr.committee)
+                .map_err(|e| DkgError::CryptoError(e.to_string()))?
+            {
+                tracing::error!(
+                    "Self in certificate signers but message not available for dealer {:?}.",
+                    message.dealer_address
+                );
+                return Err(DkgError::ProtocolFailed(
+                    "Self in certificate signers but message not available".to_string(),
+                ));
+            }
+            let request = RetrieveMessageRequest {
+                dealer: message.dealer_address,
+            };
+            let signers = certificate
+                .signers(&mgr.committee)
+                .map_err(|e| DkgError::InvalidCertificate(e.to_string()))?;
+            (request, signers, mgr.address)
         };
         // TODO: Implement gradual escalation strategy for better network efficiency:
         // - Round 1: Call 1-2 random signers, wait ~2s
         // - Round 2: Call 2-3 more signers, wait ~2s
         // - and so on
-        if certificate
-            .is_signer(&self.address, &self.committee)
-            .map_err(|e| DkgError::CryptoError(e.to_string()))?
-        {
-            tracing::error!(
-                "Self in certificate signers but message not available for dealer {:?}.",
-                message.dealer_address
-            );
-            return Err(DkgError::ProtocolFailed(
-                "Self in certificate signers but message not available".to_string(),
-            ));
-        }
-        let signers = certificate.signers(&self.committee).map_err(|_| {
-            DkgError::ProtocolFailed(
-                "Certificate does not match the current epoch or committee".to_string(),
-            )
-        })?;
-        let result = fetch_first_valid(
-            signers,
-            request,
-            |signer_address, request| async move {
-                p2p_channel
-                    .retrieve_message(&signer_address, &request)
-                    .await
-            },
-            |r| r.message,
-            compute_message_hash,
-            message.message_hash,
-            "message",
-        )
-        .await;
-        match result {
-            Some((_, msg)) => {
-                self.store_message(message.dealer_address, &msg)?;
-                Ok(())
+        for signer in signers {
+            if signer == self_address {
+                continue;
             }
-            None => Err(DkgError::PairwiseCommunicationError(
-                "Failed to retrieve message from any signer".to_string(),
-            )),
+            match p2p_channel.retrieve_message(&signer, &request).await {
+                Ok(response) => {
+                    if compute_message_hash(&response.message) == message.message_hash {
+                        let mut mgr = dkg_manager.lock().unwrap();
+                        mgr.store_message(message.dealer_address, &response.message)?;
+                        return Ok(());
+                    }
+                    tracing::info!(
+                        "Message hash mismatch from signer {:?} for dealer {:?}",
+                        signer,
+                        message.dealer_address
+                    );
+                }
+                Err(e) => {
+                    tracing::info!("Failed to retrieve message from signer {:?}: {}", signer, e);
+                }
+            }
         }
+        Err(DkgError::PairwiseCommunicationError(format!(
+            "Could not retrieve message for dealer {:?} from any signer",
+            message.dealer_address
+        )))
+    }
+
+    fn prepare_dealer_flow(
+        &mut self,
+        rng: &mut impl fastcrypto::traits::AllowedRng,
+    ) -> DkgResult<DealerFlowData> {
+        let message = match self.dealer_messages.get(&self.address) {
+            Some(msg) => msg.clone(),
+            None => {
+                let msg = self.create_dealer_message(rng);
+                self.store_message(self.address, &msg)?;
+                self.try_sign_message(self.address, &msg)?;
+                msg
+            }
+        };
+        let message_hash = compute_message_hash(&message);
+        let dkg_message = DkgDealerMessageHash {
+            dealer_address: self.address,
+            message_hash,
+        };
+        let my_signature = self
+            .signing_key
+            .sign(self.dkg_config.epoch, self.address, &dkg_message);
+        let recipients: Vec<_> = self
+            .committee
+            .members()
+            .iter()
+            .map(|m| m.validator_address())
+            .filter(|addr| *addr != self.address)
+            .collect();
+        let required_weight = self.dkg_config.threshold + self.dkg_config.max_faulty;
+        let request = SendMessageRequest {
+            message: message.clone(),
+        };
+        Ok(DealerFlowData {
+            message,
+            request,
+            recipients,
+            dkg_message_hash: dkg_message,
+            my_address: self.address,
+            my_signature,
+            required_weight,
+            committee: self.committee.clone(),
+        })
     }
 
     async fn retrieve_rotation_messages(
         &mut self,
         message: &RotationDealerMessagesHash,
-        certificate: &Certificate,
+        certificate: &RotationCertificate,
         p2p_channel: &impl P2PChannel,
     ) -> DkgResult<()> {
         let request = RetrieveRotationMessagesRequest {
@@ -1024,33 +1095,38 @@ impl DkgManager {
     }
 
     async fn recover_shares_via_complaint(
-        &mut self,
+        dkg_manager: &Arc<Mutex<Self>>,
         dealer: &Address,
-        signers: impl IntoIterator<Item = Address>,
+        signers: Vec<Address>,
         p2p_channel: &impl P2PChannel,
     ) -> DkgResult<()> {
-        let complaint = self
-            .complaints_to_process
-            .get(dealer)
-            .ok_or_else(|| DkgError::ProtocolFailed("No complaint for dealer".into()))?
-            .clone();
-        let complaint_request = ComplainRequest {
-            dealer: *dealer,
-            complaint: complaint.clone(),
+        let (complaint_request, receiver, message) = {
+            let mgr = dkg_manager.lock().unwrap();
+            let complaint = mgr
+                .complaints_to_process
+                .get(dealer)
+                .ok_or_else(|| DkgError::ProtocolFailed("No complaint for dealer".into()))?
+                .clone();
+            let complaint_request = ComplainRequest {
+                dealer: *dealer,
+                complaint,
+            };
+            let dealer_session_id = mgr.session_id.dealer_session_id(dealer);
+            let receiver = avss::Receiver::new(
+                mgr.dkg_config.nodes.clone(),
+                mgr.party_id,
+                mgr.dkg_config.threshold,
+                dealer_session_id.to_vec(),
+                None,
+                mgr.encryption_key.clone(),
+            );
+            let message = mgr
+                .dealer_messages
+                .get(dealer)
+                .expect("cannot have complaint without message")
+                .clone();
+            (complaint_request, receiver, message)
         };
-        let dealer_session_id = self.session_id.dealer_session_id(dealer);
-        let receiver = avss::Receiver::new(
-            self.dkg_config.nodes.clone(),
-            self.party_id,
-            self.dkg_config.threshold,
-            dealer_session_id.to_vec(),
-            None,
-            self.encryption_key.clone(),
-        );
-        let message = self
-            .dealer_messages
-            .get(dealer)
-            .expect("cannot have complaint without message");
         let mut responses = Vec::new();
         for signer in signers {
             let response =
@@ -1064,10 +1140,11 @@ impl DkgManager {
                     }
                 };
             responses.push(response.response);
-            match receiver.recover(message, responses.clone()) {
+            match receiver.recover(&message, responses.clone()) {
                 Ok(partial_output) => {
-                    self.dealer_outputs.insert(*dealer, partial_output);
-                    self.complaints_to_process.remove(dealer);
+                    let mut mgr = dkg_manager.lock().unwrap();
+                    mgr.dealer_outputs.insert(*dealer, partial_output);
+                    mgr.complaints_to_process.remove(dealer);
                     return Ok(());
                 }
                 Err(FastCryptoError::InputTooShort(_)) => {
@@ -1325,14 +1402,13 @@ impl DkgManager {
         }
         self.rotation_outputs.extend(outputs);
         let messages_hash = compute_rotation_messages_hash(rotation_messages);
-        let signature = self.signing_key.sign(
-            self.dkg_config.epoch,
-            self.address,
-            &Rotation(RotationDealerMessagesHash {
-                dealer_address: dealer,
-                messages_hash,
-            }),
-        );
+        let rotation_message = RotationDealerMessagesHash {
+            dealer_address: dealer,
+            messages_hash,
+        };
+        let signature =
+            self.signing_key
+                .sign(self.dkg_config.epoch, self.address, &rotation_message);
         Ok(signature.signature().clone())
     }
 
@@ -1384,18 +1460,17 @@ impl DkgManager {
     // TODO: Handle new committee members who weren't in the previous committee.
     fn reconstruct_previous_dkg_output(
         &mut self,
-        certificates: &[Certificate],
+        certificates: &[CertificateV1],
     ) -> DkgResult<DkgOutput> {
         let mut certified_dealers = HashMap::new();
         for cert in certificates {
-            let (dealer_address, expected_hash) = match cert.message() {
-                Dkg(msg) => (msg.dealer_address, msg.message_hash),
-                Rotation(_) => {
-                    return Err(DkgError::InvalidCertificate(
-                        "Expected DKG certificate, got Rotation".into(),
-                    ));
-                }
+            let CertificateV1::Dkg(dkg_cert) = cert else {
+                return Err(DkgError::InvalidCertificate(
+                    "Expected DKG certificate, got Rotation".into(),
+                ));
             };
+            let msg = dkg_cert.message();
+            let (dealer_address, expected_hash) = (msg.dealer_address, msg.message_hash);
             let message = self
                 .public_messages_store
                 .get_dealer_message(&dealer_address)
@@ -1475,7 +1550,7 @@ impl DkgManager {
 
     async fn prepare_previous_dkg_output(
         &mut self,
-        dkg_certificates: &[Certificate],
+        dkg_certificates: &[CertificateV1],
         p2p_channel: &impl P2PChannel,
     ) -> DkgResult<(DkgOutput, bool)> {
         let is_member_of_previous_committee = self
@@ -1486,7 +1561,6 @@ impl DkgManager {
         let previous = if is_member_of_previous_committee {
             self.reconstruct_previous_dkg_output(dkg_certificates)?
         } else {
-            tracing::debug!("New committee member: fetching public DKG output from quorum");
             let previous_nodes = self.previous_nodes.as_ref().ok_or_else(|| {
                 DkgError::InvalidConfig("Key rotation requires previous nodes".into())
             })?;
@@ -1515,7 +1589,7 @@ fn compute_message_hash(message: &avss::Message) -> MessageHash {
     let message_bytes = bcs::to_bytes(message).expect(EXPECT_SERIALIZATION_SUCCESS);
     let mut hasher = Blake2b256::default();
     hasher.update(&message_bytes);
-    hasher.finalize().into()
+    MessageHash::from(hasher.finalize().digest)
 }
 
 fn compute_bft_threshold(total_weight: u16) -> u16 {
@@ -1524,12 +1598,12 @@ fn compute_bft_threshold(total_weight: u16) -> u16 {
 
 fn compute_rotation_messages_hash(bundle: &RotationMessages) -> MessageHash {
     let bytes = bcs::to_bytes(bundle).expect(EXPECT_SERIALIZATION_SUCCESS);
-    Blake2b256::digest(&bytes).into()
+    MessageHash::from(Blake2b256::digest(&bytes).digest)
 }
 
 fn hash_public_dkg_output(output: &PublicDkgOutput) -> [u8; 32] {
     let bytes = bcs::to_bytes(output).expect(EXPECT_SERIALIZATION_SUCCESS);
-    Blake2b256::digest(&bytes).into()
+    Blake2b256::digest(&bytes).digest
 }
 
 async fn send_to_many<Req, Resp, F, Fut>(
@@ -1901,12 +1975,12 @@ mod tests {
         dealer_message: &avss::Message,
         dealer_address: Address,
         signatures: Vec<MemberSignature>,
-    ) -> DkgResult<Certificate> {
+    ) -> DkgResult<DkgCertificate> {
         let message_hash = compute_message_hash(dealer_message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address,
             message_hash,
-        });
+        };
         let mut aggregator = BlsSignatureAggregator::new(committee, dkg_message);
         for signature in signatures {
             aggregator
@@ -1923,12 +1997,12 @@ mod tests {
         rotation_messages: &RotationMessages,
         dealer_address: Address,
         signatures: Vec<MemberSignature>,
-    ) -> DkgResult<Certificate> {
+    ) -> DkgResult<RotationCertificate> {
         let messages_hash = compute_rotation_messages_hash(rotation_messages);
-        let rotation_message = Rotation(RotationDealerMessagesHash {
+        let rotation_message = RotationDealerMessagesHash {
             dealer_address,
             messages_hash,
-        });
+        };
         let mut aggregator = BlsSignatureAggregator::new(committee, rotation_message);
         for signature in signatures {
             aggregator
@@ -2114,8 +2188,8 @@ mod tests {
     }
 
     struct MockOrderedBroadcastChannel {
-        certificates: std::sync::Mutex<std::collections::VecDeque<Certificate>>,
-        published: std::sync::Mutex<Vec<Certificate>>,
+        certificates: std::sync::Mutex<std::collections::VecDeque<CertificateV1>>,
+        published: std::sync::Mutex<Vec<CertificateV1>>,
         /// Override for existing_certificate_weight().
         /// If set, returns this value instead of the pending message count.
         override_existing_weight: Option<u32>,
@@ -2124,7 +2198,7 @@ mod tests {
     }
 
     impl MockOrderedBroadcastChannel {
-        fn new(certificates: Vec<Certificate>) -> Self {
+        fn new(certificates: Vec<CertificateV1>) -> Self {
             Self {
                 certificates: std::sync::Mutex::new(certificates.into()),
                 published: std::sync::Mutex::new(Vec::new()),
@@ -2153,18 +2227,20 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl OrderedBroadcastChannel<Certificate> for MockOrderedBroadcastChannel {
-        async fn publish(&self, message: Certificate) -> ChannelResult<()> {
+    impl OrderedBroadcastChannel<CertificateV1> for MockOrderedBroadcastChannel {
+        async fn publish(&self, message: CertificateV1) -> ChannelResult<()> {
             if let Some(ref error_msg) = self.fail_on_publish {
                 return Err(crate::communication::ChannelError::RequestFailed(
                     error_msg.clone(),
                 ));
             }
-            self.published.lock().unwrap().push(message);
+            self.published.lock().unwrap().push(message.clone());
+            // Also add to certificates so it's available for receive
+            self.certificates.lock().unwrap().push_back(message);
             Ok(())
         }
 
-        async fn receive(&mut self) -> ChannelResult<Certificate> {
+        async fn receive(&mut self) -> ChannelResult<CertificateV1> {
             self.certificates
                 .lock()
                 .unwrap()
@@ -2558,8 +2634,8 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl OrderedBroadcastChannel<Certificate> for FailingOrderedBroadcastChannel {
-        async fn publish(&self, _message: Certificate) -> ChannelResult<()> {
+    impl OrderedBroadcastChannel<CertificateV1> for FailingOrderedBroadcastChannel {
+        async fn publish(&self, _message: CertificateV1) -> ChannelResult<()> {
             if self.fail_on_publish {
                 Err(crate::communication::ChannelError::RequestFailed(
                     self.error_message.clone(),
@@ -2569,7 +2645,7 @@ mod tests {
             }
         }
 
-        async fn receive(&mut self) -> ChannelResult<Certificate> {
+        async fn receive(&mut self) -> ChannelResult<CertificateV1> {
             if self.fail_on_receive {
                 Err(crate::communication::ChannelError::RequestFailed(
                     self.error_message.clone(),
@@ -2941,7 +3017,7 @@ mod tests {
             // Create certificate using helper
             let cert = create_test_certificate(setup.committee(), message, dealer_addr, signatures)
                 .unwrap();
-            certificates.push(cert);
+            certificates.push(CertificateV1::Dkg(cert));
         }
 
         // Phase 3: Test run_as_dealer() and run_as_party() for validator 0 with mocked channels
@@ -2968,13 +3044,13 @@ mod tests {
         let other_certificates_len = other_certificates.len();
         let mut mock_tob = MockOrderedBroadcastChannel::new(other_certificates);
 
+        let test_manager = Arc::new(Mutex::new(test_manager));
+
         // Call run_as_dealer() and run_as_party() for validator 0
-        test_manager
-            .run_as_dealer(&mock_p2p, &mut mock_tob, &mut rng)
+        DkgManager::run_as_dealer(&test_manager, &mock_p2p, &mut mock_tob)
             .await
             .unwrap();
-        let output = test_manager
-            .run_as_party(&mock_p2p, &mut mock_tob)
+        let output = DkgManager::run_as_party(&test_manager, &mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
@@ -3016,9 +3092,9 @@ mod tests {
 
     /// Test setup for run() tests. Creates managers and certificates.
     struct RunTestSetup {
-        test_manager: DkgManager,
+        test_manager: Arc<Mutex<DkgManager>>,
         mock_p2p: MockP2PChannel,
-        certificates: Vec<Certificate>,
+        certificates: Vec<CertificateV1>,
     }
 
     fn setup_run_test() -> RunTestSetup {
@@ -3053,11 +3129,11 @@ mod tests {
 
             let cert = create_test_certificate(setup.committee(), message, dealer_addr, signatures)
                 .unwrap();
-            certificates.push(cert);
+            certificates.push(CertificateV1::Dkg(cert));
         }
 
         // Extract test_manager (validator 0)
-        let test_manager = managers.remove(0);
+        let test_manager = Arc::new(Mutex::new(managers.remove(0)));
 
         // Create mock P2P with remaining managers
         let other_managers: HashMap<_, _> = managers
@@ -3076,17 +3152,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_triggers_dealer_phase() {
-        let mut rng = rand::thread_rng();
-        let mut setup = setup_run_test();
+        let setup = setup_run_test();
 
         // All certificates are from dealers 1-4 (not dealer 0)
         // Override weight to 0 so dealer phase runs, but provide enough certs for party to complete
         let mut mock_tob =
             MockOrderedBroadcastChannel::new(setup.certificates).with_override_weight(0);
 
-        let output = setup
-            .test_manager
-            .run(&setup.mock_p2p, &mut mock_tob, &mut rng)
+        let output = DkgManager::run(&setup.test_manager, &setup.mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
@@ -3102,16 +3175,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_skips_dealer_phase() {
-        let mut rng = rand::thread_rng();
-        let mut setup = setup_run_test();
+        let setup = setup_run_test();
 
         // All certificates are from dealers 1-4 (not dealer 0)
         // With 4 certificates and threshold = 2, existing_weight = 4 >= 2, dealer skips
         let mut mock_tob = MockOrderedBroadcastChannel::new(setup.certificates);
 
-        let output = setup
-            .test_manager
-            .run(&setup.mock_p2p, &mut mock_tob, &mut rng)
+        let output = DkgManager::run(&setup.test_manager, &setup.mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
@@ -3129,8 +3199,7 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn test_run_dealer_failure_party_still_executes() {
-        let mut rng = rand::thread_rng();
-        let mut setup = setup_run_test();
+        let setup = setup_run_test();
 
         // All certificates are from dealers 1-4 (not dealer 0)
         // Override weight to 0 so dealer phase runs, but make publish fail
@@ -3138,9 +3207,7 @@ mod tests {
             .with_override_weight(0)
             .with_fail_on_publish("simulated publish failure");
 
-        let output = setup
-            .test_manager
-            .run(&setup.mock_p2p, &mut mock_tob, &mut rng)
+        let output = DkgManager::run(&setup.test_manager, &setup.mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
@@ -3154,12 +3221,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_as_dealer_success() {
-        let mut rng = rand::thread_rng();
         let num_validators = 5;
         let setup = TestSetup::new(num_validators);
 
         // Create manager for validator 0
-        let mut test_manager = setup.create_manager(0);
+        let test_manager = Arc::new(Mutex::new(setup.create_manager(0)));
 
         // Create managers for other validators
         let other_managers: HashMap<_, _> = (1..num_validators)
@@ -3170,16 +3236,20 @@ mod tests {
         let mut mock_tob = MockOrderedBroadcastChannel::new(Vec::new());
 
         // Call run_as_dealer()
-        let result = test_manager
-            .run_as_dealer(&mock_p2p, &mut mock_tob, &mut rng)
-            .await;
+        let result = DkgManager::run_as_dealer(&test_manager, &mock_p2p, &mut mock_tob).await;
 
         // Verify success
         assert!(result.is_ok());
 
         // Verify own dealer output is stored
         let addr0 = setup.address(0);
-        assert!(test_manager.dealer_outputs.contains_key(&addr0));
+        assert!(
+            test_manager
+                .lock()
+                .unwrap()
+                .dealer_outputs
+                .contains_key(&addr0)
+        );
 
         // Verify other validators received dealer message via P2P
         let other_managers = mock_p2p.managers.lock().unwrap();
@@ -3229,22 +3299,21 @@ mod tests {
             // Create certificate using helper
             let cert = create_test_certificate(setup.committee(), message, dealer_addr, signatures)
                 .unwrap();
-            certificates.push(cert);
+            certificates.push(CertificateV1::Dkg(cert));
         }
 
         // Create mock TOB with threshold certificates
         let mut mock_tob = MockOrderedBroadcastChannel::new(certificates.clone());
 
         // Call run_as_party() for validator 0
-        let mut test_manager = managers.remove(0);
+        let test_manager = Arc::new(Mutex::new(managers.remove(0)));
         let other_managers: HashMap<_, _> = managers
             .into_iter()
             .enumerate()
             .map(|(idx, mgr)| (setup.address(idx + 1), mgr))
             .collect();
         let mock_p2p = MockP2PChannel::new(other_managers, setup.address(0));
-        let output = test_manager
-            .run_as_party(&mock_p2p, &mut mock_tob)
+        let output = DkgManager::run_as_party(&test_manager, &mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
@@ -3270,19 +3339,19 @@ mod tests {
             .unwrap()
             .clone();
         let dealer_0_message_hash = compute_message_hash(&dealer_0_message);
-        let dealer_0_dkg_message = Dkg(DkgDealerMessageHash {
+        let dealer_0_dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_0_addr,
             message_hash: dealer_0_message_hash,
-        });
+        };
 
         // Create dealer 1 with cheating message (corrupts party 2's shares)
         let dealer_1_addr = setup.address(1);
         let dealer_1_message = create_cheating_message(&setup, 1, 2, &mut rng);
         let dealer_1_message_hash = compute_message_hash(&dealer_1_message);
-        let dealer_1_dkg_message = Dkg(DkgDealerMessageHash {
+        let dealer_1_dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_1_addr,
             message_hash: dealer_1_message_hash,
-        });
+        };
 
         // Create party 2 manager (will have complaint for dealer 1)
         let party_addr = setup.address(2);
@@ -3320,14 +3389,13 @@ mod tests {
             setup.committee(),
             dealer_0_addr,
             &dealer_0_message,
-            [
-                (0usize, setup.address(0)),
-                (1, setup.address(1)),
-                (3, setup.address(3)),
-            ]
-            .iter()
-            .map(|(i, a)| setup.signing_keys[*i].sign(epoch, *a, &dealer_0_dkg_message))
-            .collect(),
+            [0usize, 1, 3]
+                .iter()
+                .map(|i| {
+                    let addr = setup.address(*i);
+                    setup.signing_keys[*i].sign(epoch, addr, &dealer_0_dkg_message)
+                })
+                .collect(),
         )
         .unwrap();
 
@@ -3335,18 +3403,17 @@ mod tests {
             setup.committee(),
             dealer_1_addr,
             &dealer_1_message,
-            [
-                (0usize, setup.address(0)),
-                (1, setup.address(1)),
-                (3, setup.address(3)),
-            ]
-            .iter()
-            .map(|(i, a)| setup.signing_keys[*i].sign(epoch, *a, &dealer_1_dkg_message))
-            .collect(),
+            [0usize, 1, 3]
+                .iter()
+                .map(|i| {
+                    let addr = setup.address(*i);
+                    setup.signing_keys[*i].sign(epoch, addr, &dealer_1_dkg_message)
+                })
+                .collect(),
         )
         .unwrap();
 
-        let certificates = vec![cert_0, cert_1];
+        let certificates = vec![CertificateV1::Dkg(cert_0), CertificateV1::Dkg(cert_1)];
         let mut mock_tob = MockOrderedBroadcastChannel::new(certificates);
         let mock_p2p = MockP2PChannel::new(other_managers, party_addr);
 
@@ -3357,21 +3424,21 @@ mod tests {
                 .contains_key(&dealer_1_addr)
         );
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Run as party - should recover shares via complaint
-        let output = party_manager
-            .run_as_party(&mock_p2p, &mut mock_tob)
+        let output = DkgManager::run_as_party(&party_manager, &mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
         // Verify complaint was resolved
+        let mgr = party_manager.lock().unwrap();
         assert!(
-            !party_manager
-                .complaints_to_process
-                .contains_key(&dealer_1_addr),
+            !mgr.complaints_to_process.contains_key(&dealer_1_addr),
             "Complaint should be cleared after successful recovery"
         );
         assert!(
-            party_manager.dealer_outputs.contains_key(&dealer_1_addr),
+            mgr.dealer_outputs.contains_key(&dealer_1_addr),
             "Dealer output should exist for dealer 1 after recovery"
         );
 
@@ -3415,7 +3482,7 @@ mod tests {
             // Create certificate using helper
             let cert = create_test_certificate(setup.committee(), message, dealer_addr, signatures)
                 .unwrap();
-            valid_certificates.push(cert);
+            valid_certificates.push(CertificateV1::Dkg(cert));
         }
 
         // Create certificate that will fail validation due to hash mismatch
@@ -3437,10 +3504,10 @@ mod tests {
             .skip(1) // Skip test_manager who has wrong message
             .map(|mgr| {
                 let message_hash = compute_message_hash(&invalid_dealer_msg);
-                let dkg_message = Dkg(DkgDealerMessageHash {
+                let dkg_message = DkgDealerMessageHash {
                     dealer_address: dealer_addr_3,
                     message_hash,
-                });
+                };
                 setup.signing_keys[mgr.party_id as usize].sign(
                     setup.epoch(),
                     mgr.address,
@@ -3462,7 +3529,7 @@ mod tests {
         // With threshold=2, we need accumulated weight >= 2 from unique dealers
         let mut all_certificates = vec![
             valid_certificates[0].clone(),
-            invalid_cert, // hash mismatch - will be recovered from P2P
+            CertificateV1::Dkg(invalid_cert), // hash mismatch - will be recovered from P2P
         ];
         // Add remaining valid certificates if any
         for cert in valid_certificates.iter().skip(1) {
@@ -3473,15 +3540,14 @@ mod tests {
         let mut mock_tob = MockOrderedBroadcastChannel::new(all_certificates);
 
         // Call run_as_party() for validator 0
-        let mut test_manager = managers.remove(0);
+        let test_manager = Arc::new(Mutex::new(managers.remove(0)));
         let other_managers: HashMap<_, _> = managers
             .into_iter()
             .enumerate()
             .map(|(idx, mgr)| (setup.address(idx + 1), mgr))
             .collect();
         let mock_p2p = MockP2PChannel::new(other_managers, setup.address(0));
-        let output = test_manager
-            .run_as_party(&mock_p2p, &mut mock_tob)
+        let output = DkgManager::run_as_party(&test_manager, &mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
@@ -3532,7 +3598,7 @@ mod tests {
             // Create certificate using helper
             let cert = create_test_certificate(setup.committee(), message, dealer_addr, signatures)
                 .unwrap();
-            certificates.push(cert);
+            certificates.push(CertificateV1::Dkg(cert));
         }
 
         // Mock TOB delivers: dealer 0 cert, dealer 0 cert again (duplicate), then dealer 1 cert
@@ -3545,7 +3611,7 @@ mod tests {
         let mut mock_tob = MockOrderedBroadcastChannel::new(tob_messages);
 
         // Call run_as_party() for validator 2
-        let mut test_manager = managers.remove(2);
+        let test_manager = Arc::new(Mutex::new(managers.remove(2)));
         let other_managers: HashMap<_, _> = managers
             .into_iter()
             .enumerate()
@@ -3555,8 +3621,7 @@ mod tests {
             })
             .collect();
         let mock_p2p = MockP2PChannel::new(other_managers, setup.address(2));
-        let output = test_manager
-            .run_as_party(&mock_p2p, &mut mock_tob)
+        let output = DkgManager::run_as_party(&test_manager, &mock_p2p, &mut mock_tob)
             .await
             .unwrap();
 
@@ -3571,17 +3636,15 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn test_run_as_dealer_p2p_send_error() {
-        let mut rng = rand::thread_rng();
-        let (mut test_manager, _) = create_manager_with_valid_keys(0, 5);
+        let (test_manager, _) = create_manager_with_valid_keys(0, 5);
+        let test_manager = Arc::new(Mutex::new(test_manager));
 
         let failing_p2p = FailingP2PChannel {
             error_message: "network error".to_string(),
         };
         let mut mock_tob = MockOrderedBroadcastChannel::new(Vec::new());
 
-        let result = test_manager
-            .run_as_dealer(&failing_p2p, &mut mock_tob, &mut rng)
-            .await;
+        let result = DkgManager::run_as_dealer(&test_manager, &failing_p2p, &mut mock_tob).await;
 
         assert!(result.is_ok());
         assert_eq!(mock_tob.published_count(), 0);
@@ -3591,11 +3654,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_as_dealer_tob_publish_error() {
-        let mut rng = rand::thread_rng();
         let setup = TestSetup::new(5);
 
         // Create test manager (validator 0)
-        let mut test_manager = setup.create_manager(0);
+        let test_manager = Arc::new(Mutex::new(setup.create_manager(0)));
 
         // Create managers for validators 1-4 to respond with valid signatures
         let other_managers: HashMap<_, _> = (1..setup.num_validators())
@@ -3614,9 +3676,8 @@ mod tests {
             fail_on_receive: false,
         };
 
-        let result = test_manager
-            .run_as_dealer(&succeeding_p2p, &mut failing_tob, &mut rng)
-            .await;
+        let result =
+            DkgManager::run_as_dealer(&test_manager, &succeeding_p2p, &mut failing_tob).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -3626,13 +3687,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_as_dealer_partial_failures_still_collects_enough() {
-        let mut rng = rand::thread_rng();
         // Use 7 validators so we have more room for failures
         // threshold=4, max_faulty=1, required_sigs=5
         // Dealer sends to 6 others, fail 1, succeed 5
         let setup = TestSetup::new(7);
 
-        let mut test_manager = setup.create_manager(0);
+        let test_manager = Arc::new(Mutex::new(setup.create_manager(0)));
 
         let other_managers: HashMap<_, _> = (1..setup.num_validators())
             .map(|i| {
@@ -3650,9 +3710,8 @@ mod tests {
 
         let mut mock_tob = MockOrderedBroadcastChannel::new(Vec::new());
 
-        let result = test_manager
-            .run_as_dealer(&partially_failing_p2p, &mut mock_tob, &mut rng)
-            .await;
+        let result =
+            DkgManager::run_as_dealer(&test_manager, &partially_failing_p2p, &mut mock_tob).await;
 
         assert!(result.is_ok());
         // Verify that a certificate was published
@@ -3662,10 +3721,9 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn test_run_as_dealer_partial_failures_insufficient_signatures() {
-        let mut rng = rand::thread_rng();
         let setup = TestSetup::new(5);
 
-        let mut test_manager = setup.create_manager(0);
+        let test_manager = Arc::new(Mutex::new(setup.create_manager(0)));
 
         let other_managers: HashMap<_, _> = (1..setup.num_validators())
             .map(|i| {
@@ -3681,9 +3739,8 @@ mod tests {
 
         let mut mock_tob = MockOrderedBroadcastChannel::new(Vec::new());
 
-        let result = test_manager
-            .run_as_dealer(&partially_failing_p2p, &mut mock_tob, &mut rng)
-            .await;
+        let result =
+            DkgManager::run_as_dealer(&test_manager, &partially_failing_p2p, &mut mock_tob).await;
 
         assert!(result.is_ok());
         assert_eq!(mock_tob.published_count(), 0);
@@ -3692,12 +3749,11 @@ mod tests {
     }
     #[tokio::test]
     async fn test_run_as_dealer_includes_own_signature() {
-        let mut rng = rand::thread_rng();
         let setup = TestSetup::new(5);
 
         // Create manager for validator 0 (the dealer)
         let dealer_addr = setup.address(0);
-        let mut test_manager = setup.create_manager(0);
+        let test_manager = Arc::new(Mutex::new(setup.create_manager(0)));
 
         // Create managers for other validators
         let other_managers: HashMap<_, _> = (1..setup.num_validators())
@@ -3712,9 +3768,7 @@ mod tests {
         let mut mock_tob = MockOrderedBroadcastChannel::new(Vec::new());
 
         // Run as dealer
-        let result = test_manager
-            .run_as_dealer(&mock_p2p, &mut mock_tob, &mut rng)
-            .await;
+        let result = DkgManager::run_as_dealer(&test_manager, &mock_p2p, &mut mock_tob).await;
 
         assert!(result.is_ok());
 
@@ -3748,7 +3802,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_as_party_tob_receive_error() {
         let setup = TestSetup::new(5);
-        let mut test_manager = setup.create_manager(0);
+        let test_manager = Arc::new(Mutex::new(setup.create_manager(0)));
 
         let mut failing_tob = FailingOrderedBroadcastChannel {
             error_message: "receive timeout".to_string(),
@@ -3757,7 +3811,7 @@ mod tests {
         };
 
         let mock_p2p = MockP2PChannel::new(HashMap::new(), setup.address(0));
-        let result = test_manager.run_as_party(&mock_p2p, &mut failing_tob).await;
+        let result = DkgManager::run_as_party(&test_manager, &mock_p2p, &mut failing_tob).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -3768,7 +3822,7 @@ mod tests {
     struct WeightBasedTestSetup {
         setup: TestSetup,
         dealer_messages: Vec<(Address, avss::Message)>,
-        certificates: Vec<Certificate>,
+        certificates: Vec<CertificateV1>,
     }
 
     //
@@ -3813,12 +3867,12 @@ mod tests {
         setup: &TestSetup,
         dealer_addr: &Address,
         message: &avss::Message,
-    ) -> Certificate {
+    ) -> CertificateV1 {
         let message_hash = compute_message_hash(message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address: *dealer_addr,
             message_hash,
-        });
+        };
 
         let config = setup.dkg_config();
         let committee = setup.committee();
@@ -3845,7 +3899,7 @@ mod tests {
             }
         }
 
-        aggregator.finish().unwrap()
+        CertificateV1::Dkg(aggregator.finish().unwrap())
     }
 
     // Helper to create and setup a party manager for testing
@@ -3867,7 +3921,8 @@ mod tests {
 
         // Run party collection
         let mock_p2p = MockP2PChannel::new(HashMap::new(), party_addr);
-        let result = party_manager.run_as_party(&mock_p2p, &mut mock_tob).await;
+        let party_manager = Arc::new(Mutex::new(party_manager));
+        let result = DkgManager::run_as_party(&party_manager, &mock_p2p, &mut mock_tob).await;
 
         (result, mock_tob)
     }
@@ -3973,7 +4028,8 @@ mod tests {
 
         // Run party collection
         let mock_p2p = MockP2PChannel::new(HashMap::new(), party_addr);
-        let result = party_manager.run_as_party(&mock_p2p, &mut mock_tob).await;
+        let party_manager = Arc::new(Mutex::new(party_manager));
+        let result = DkgManager::run_as_party(&party_manager, &mock_p2p, &mut mock_tob).await;
         assert!(result.is_ok());
 
         // Verify behavior:
@@ -4005,7 +4061,7 @@ mod tests {
 
         // Create party (validator 3) WITHOUT pre-processing dealer messages
         let party_addr = setup.address(3);
-        let mut party_manager = setup.create_manager(3);
+        let party_manager = setup.create_manager(3);
 
         // Get the dealer messages for certificate creation
         let msg1 = dealer1_mgr
@@ -4025,10 +4081,10 @@ mod tests {
             .map(|i| {
                 let addr = setup.address(i);
                 let message_hash = compute_message_hash(&msg1);
-                let dkg_message = Dkg(DkgDealerMessageHash {
+                let dkg_message = DkgDealerMessageHash {
                     dealer_address: dealer1_addr,
                     message_hash,
-                });
+                };
                 setup.signing_keys[i].sign(epoch, addr, &dkg_message)
             })
             .collect();
@@ -4037,10 +4093,10 @@ mod tests {
             .map(|i| {
                 let addr = setup.address(i);
                 let message_hash = compute_message_hash(&msg2);
-                let dkg_message = Dkg(DkgDealerMessageHash {
+                let dkg_message = DkgDealerMessageHash {
                     dealer_address: dealer2_addr,
                     message_hash,
-                });
+                };
                 setup.signing_keys[i].sign(epoch, addr, &dkg_message)
             })
             .collect();
@@ -4058,20 +4114,23 @@ mod tests {
         let mock_p2p = MockP2PChannel::new(dealers, party_addr);
 
         // Create mock TOB with certificates - threshold is 2, so we need 2 dealers
-        let certificates = vec![cert1, cert2];
+        let certificates = vec![CertificateV1::Dkg(cert1), CertificateV1::Dkg(cert2)];
         let mut mock_tob = MockOrderedBroadcastChannel::new(certificates);
 
         // Verify party doesn't have any dealer messages yet
         assert!(party_manager.dealer_messages.is_empty());
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Run as party - should retrieve missing messages via P2P
-        let result = party_manager.run_as_party(&mock_p2p, &mut mock_tob).await;
+        let result = DkgManager::run_as_party(&party_manager, &mock_p2p, &mut mock_tob).await;
 
         assert!(result.is_ok());
-        assert!(party_manager.dealer_messages.contains_key(&dealer1_addr));
-        assert!(party_manager.dealer_messages.contains_key(&dealer2_addr));
-        assert!(party_manager.dealer_outputs.contains_key(&dealer1_addr));
-        assert!(party_manager.dealer_outputs.contains_key(&dealer2_addr));
+        let mgr = party_manager.lock().unwrap();
+        assert!(mgr.dealer_messages.contains_key(&dealer1_addr));
+        assert!(mgr.dealer_messages.contains_key(&dealer2_addr));
+        assert!(mgr.dealer_outputs.contains_key(&dealer1_addr));
+        assert!(mgr.dealer_outputs.contains_key(&dealer2_addr));
     }
 
     #[tokio::test]
@@ -4090,7 +4149,7 @@ mod tests {
 
         // Create party (validator 3) WITHOUT pre-processing dealer messages
         let party_addr = setup.address(3);
-        let mut party_manager = setup.create_manager(3);
+        let party_manager = setup.create_manager(3);
 
         // Get the dealer messages for certificate creation
         let msg1 = dealer1_mgr
@@ -4116,10 +4175,10 @@ mod tests {
                 .map(|i| {
                     let addr = setup.address(i);
                     let message_hash = compute_message_hash(msg);
-                    let dkg_message = Dkg(DkgDealerMessageHash {
+                    let dkg_message = DkgDealerMessageHash {
                         dealer_address: dealer_addr,
                         message_hash,
-                    });
+                    };
                     setup.signing_keys[i].sign(epoch, addr, &dkg_message)
                 })
                 .collect()
@@ -4156,22 +4215,29 @@ mod tests {
         let mock_p2p = MockP2PChannel::new(dealers, party_addr);
 
         // Create mock TOB with all three certificates
-        let certificates = vec![cert1, cert2, cert3];
+        let certificates = vec![
+            CertificateV1::Dkg(cert1),
+            CertificateV1::Dkg(cert2),
+            CertificateV1::Dkg(cert3),
+        ];
         let mut mock_tob = MockOrderedBroadcastChannel::new(certificates);
 
-        // Run as party - should process dealer1 successfully, then ABORT on dealer2 retrieval failure
-        let result = party_manager.run_as_party(&mock_p2p, &mut mock_tob).await;
+        let party_manager = Arc::new(Mutex::new(party_manager));
 
-        // Should fail with PairwiseCommunicationError
+        // Run as party - should process dealer1 successfully, then ABORT on dealer2 retrieval failure
+        let result = DkgManager::run_as_party(&party_manager, &mock_p2p, &mut mock_tob).await;
+
+        // Should fail with PairwiseCommunicationError (could not retrieve message from any signer)
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, DkgError::PairwiseCommunicationError(_)));
 
         // Verify party has dealer1 message (processed before failure)
-        assert!(party_manager.dealer_messages.contains_key(&dealer1_addr));
+        let mgr = party_manager.lock().unwrap();
+        assert!(mgr.dealer_messages.contains_key(&dealer1_addr));
         // But NOT dealer2 or dealer3 (aborted before processing these)
-        assert!(!party_manager.dealer_messages.contains_key(&dealer2_addr));
-        assert!(!party_manager.dealer_messages.contains_key(&dealer3_addr));
+        assert!(!mgr.dealer_messages.contains_key(&dealer2_addr));
+        assert!(!mgr.dealer_messages.contains_key(&dealer3_addr));
     }
 
     #[tokio::test]
@@ -4188,10 +4254,10 @@ mod tests {
             .unwrap()
             .clone();
         let dealer0_message_hash = compute_message_hash(&dealer0_message);
-        let dealer0_dkg_message = Dkg(DkgDealerMessageHash {
+        let dealer0_dkg_message = DkgDealerMessageHash {
             dealer_address: dealer0_addr,
             message_hash: dealer0_message_hash,
-        });
+        };
 
         // Create dealer 1 - would be processed if we continued
         let dealer1_addr = setup.address(1);
@@ -4202,10 +4268,10 @@ mod tests {
             .unwrap()
             .clone();
         let dealer1_message_hash = compute_message_hash(&dealer1_message);
-        let dealer1_dkg_message = Dkg(DkgDealerMessageHash {
+        let dealer1_dkg_message = DkgDealerMessageHash {
             dealer_address: dealer1_addr,
             message_hash: dealer1_message_hash,
-        });
+        };
 
         // Create party manager (validator 4)
         let party_addr = setup.address(4);
@@ -4226,28 +4292,26 @@ mod tests {
             setup.committee(),
             dealer0_addr,
             &dealer0_message,
-            [
-                (0usize, setup.address(0)),
-                (1, setup.address(1)),
-                (3, setup.address(3)),
-            ]
-            .iter()
-            .map(|(i, a)| setup.signing_keys[*i].sign(epoch, *a, &dealer0_dkg_message))
-            .collect(),
+            [0usize, 1, 3]
+                .iter()
+                .map(|i| {
+                    let addr = setup.address(*i);
+                    setup.signing_keys[*i].sign(epoch, addr, &dealer0_dkg_message)
+                })
+                .collect(),
         )
         .unwrap();
         let cert1 = create_certificate_with_signers(
             setup.committee(),
             dealer1_addr,
             &dealer1_message,
-            [
-                (0usize, setup.address(0)),
-                (1, setup.address(1)),
-                (3, setup.address(3)),
-            ]
-            .iter()
-            .map(|(i, a)| setup.signing_keys[*i].sign(epoch, *a, &dealer1_dkg_message))
-            .collect(),
+            [0usize, 1, 3]
+                .iter()
+                .map(|i| {
+                    let addr = setup.address(*i);
+                    setup.signing_keys[*i].sign(epoch, addr, &dealer1_dkg_message)
+                })
+                .collect(),
         )
         .unwrap();
 
@@ -4255,12 +4319,14 @@ mod tests {
         let mock_p2p = MockP2PChannel::new(HashMap::new(), party_addr);
 
         // Create mock TOB with both certificates
-        let certificates = vec![cert0, cert1];
+        let certificates = vec![CertificateV1::Dkg(cert0), CertificateV1::Dkg(cert1)];
         let mut mock_tob = MockOrderedBroadcastChannel::new(certificates);
+
+        let party_manager = Arc::new(Mutex::new(party_manager));
 
         // Run as party - should ABORT on dealer0 recovery failure
         // With retry logic, failed signers are skipped, so we get ProtocolFailed
-        let result = party_manager.run_as_party(&mock_p2p, &mut mock_tob).await;
+        let result = DkgManager::run_as_party(&party_manager, &mock_p2p, &mut mock_tob).await;
 
         // Should fail with ProtocolFailed (all signers failed, not enough responses)
         assert!(result.is_err(), "Expected error, got: {:?}", result);
@@ -4272,22 +4338,21 @@ mod tests {
         );
 
         // Verify dealer1 was NOT processed (aborted before reaching it)
+        let mgr = party_manager.lock().unwrap();
         assert!(
-            !party_manager.dealer_outputs.contains_key(&dealer1_addr),
+            !mgr.dealer_outputs.contains_key(&dealer1_addr),
             "Dealer1 should NOT be processed - aborted before reaching it"
         );
 
         // Dealer0 should NOT be in dealer_outputs (recovery failed, DKG aborted)
         assert!(
-            !party_manager.dealer_outputs.contains_key(&dealer0_addr),
+            !mgr.dealer_outputs.contains_key(&dealer0_addr),
             "Dealer0 should NOT have output - recovery failed and aborted"
         );
 
         // Complaint for dealer0 should still be present (wasn't removed due to failure)
         assert!(
-            party_manager
-                .complaints_to_process
-                .contains_key(&dealer0_addr),
+            mgr.complaints_to_process.contains_key(&dealer0_addr),
             "Complaint should remain after recovery failure"
         );
     }
@@ -4527,23 +4592,28 @@ mod tests {
         let managers_map: HashMap<_, _> = other_managers.into_iter().collect();
         let mock_p2p = MockP2PChannel::new(managers_map, party_addr);
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Recover with exactly threshold signers
         // Tests incremental recovery: receiver.recover() returns InputTooShort after first response,
         // continues to collect second response, then succeeds
-        let result = party_manager
-            .recover_shares_via_complaint(&dealer_addr, signer_addresses.into_iter(), &mock_p2p)
-            .await;
+        let result = DkgManager::recover_shares_via_complaint(
+            &party_manager,
+            &dealer_addr,
+            signer_addresses,
+            &mock_p2p,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
             "Recovery should succeed: {:?}",
             result.err()
         );
-        assert!(party_manager.dealer_outputs.contains_key(&dealer_addr));
+        let mgr = party_manager.lock().unwrap();
+        assert!(mgr.dealer_outputs.contains_key(&dealer_addr));
         assert!(
-            !party_manager
-                .complaints_to_process
-                .contains_key(&dealer_addr),
+            !mgr.complaints_to_process.contains_key(&dealer_addr),
             "Complaint should be cleared after successful recovery"
         );
     }
@@ -4592,21 +4662,26 @@ mod tests {
         let managers_map: HashMap<_, _> = other_managers.into_iter().collect();
         let mock_p2p = MockP2PChannel::new(managers_map, party_addr);
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Recovery should succeed despite first signer failing
-        let result = party_manager
-            .recover_shares_via_complaint(&dealer_addr, signer_addresses.into_iter(), &mock_p2p)
-            .await;
+        let result = DkgManager::recover_shares_via_complaint(
+            &party_manager,
+            &dealer_addr,
+            signer_addresses,
+            &mock_p2p,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
             "Recovery should succeed despite failed signer: {:?}",
             result.err()
         );
-        assert!(party_manager.dealer_outputs.contains_key(&dealer_addr));
+        let mgr = party_manager.lock().unwrap();
+        assert!(mgr.dealer_outputs.contains_key(&dealer_addr));
         assert!(
-            !party_manager
-                .complaints_to_process
-                .contains_key(&dealer_addr),
+            !mgr.complaints_to_process.contains_key(&dealer_addr),
             "Complaint should be cleared after successful recovery"
         );
     }
@@ -4618,7 +4693,7 @@ mod tests {
 
         // Create manager without any complaints
         let party_addr = setup.address(1);
-        let mut party_manager = setup.create_manager(1);
+        let party_manager = setup.create_manager(1);
 
         // Create a dealer address that has no complaint
         let dealer_addr = setup.address(0);
@@ -4626,10 +4701,10 @@ mod tests {
 
         let dealer_message = dealer_manager.dealer_messages.get(&dealer_addr).unwrap();
         let message_hash = compute_message_hash(dealer_message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_addr,
             message_hash,
-        });
+        };
 
         // Create a minimal certificate
         let committee = setup.committee();
@@ -4637,24 +4712,24 @@ mod tests {
             committee,
             dealer_addr,
             dealer_message,
-            [(1usize, party_addr)]
-                .iter()
-                .map(|(i, a)| setup.signing_keys[*i].sign(setup.epoch(), *a, &dkg_message))
-                .collect(),
+            vec![setup.signing_keys[1].sign(setup.epoch(), party_addr, &dkg_message)],
         )
         .unwrap();
 
         // Create empty mock P2P channel
         let mock_p2p = MockP2PChannel::new(HashMap::new(), party_addr);
 
+        let signers = cert.signers(&party_manager.committee).unwrap();
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Call recover_shares_via_complaint - should fail because no complaint exists
-        let result = party_manager
-            .recover_shares_via_complaint(
-                &dealer_addr,
-                cert.signers(&party_manager.committee).unwrap(),
-                &mock_p2p,
-            )
-            .await;
+        let result = DkgManager::recover_shares_via_complaint(
+            &party_manager,
+            &dealer_addr,
+            signers,
+            &mock_p2p,
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4690,12 +4765,18 @@ mod tests {
         // Create empty mock P2P channel (no responders)
         let mock_p2p = MockP2PChannel::new(HashMap::new(), party_addr);
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Call recover_shares_via_complaint - should fail because P2P call fails
         // With retry logic, failed signers are skipped (continue), so we get ProtocolFailed
         // instead of BroadcastError
-        let result = party_manager
-            .recover_shares_via_complaint(&dealer_addr, signer_addresses.into_iter(), &mock_p2p)
-            .await;
+        let result = DkgManager::recover_shares_via_complaint(
+            &party_manager,
+            &dealer_addr,
+            signer_addresses,
+            &mock_p2p,
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4745,10 +4826,16 @@ mod tests {
         let managers_map: HashMap<_, _> = other_managers.into_iter().collect();
         let mock_p2p = MockP2PChannel::new(managers_map, party_addr);
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Attempt recovery with insufficient signers
-        let result = party_manager
-            .recover_shares_via_complaint(&dealer_addr, signer_addresses.into_iter(), &mock_p2p)
-            .await;
+        let result = DkgManager::recover_shares_via_complaint(
+            &party_manager,
+            &dealer_addr,
+            signer_addresses,
+            &mock_p2p,
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4795,14 +4882,16 @@ mod tests {
         // Create mock P2P (empty is fine since we should fail before contacting anyone)
         let mock_p2p = MockP2PChannel::new(HashMap::new(), party_addr);
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Try to recover - should fail because dealer message is missing
-        let _ = party_manager
-            .recover_shares_via_complaint(
-                &dealer_addr,
-                [Address::new([2; 32])].into_iter(),
-                &mock_p2p,
-            )
-            .await;
+        let _ = DkgManager::recover_shares_via_complaint(
+            &party_manager,
+            &dealer_addr,
+            vec![Address::new([2; 32])],
+            &mock_p2p,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4869,10 +4958,16 @@ mod tests {
 
         let p2p = PreCollectedP2PChannel::new(responses);
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Attempt recovery - parties 3 and 4 are not in the modified config
-        let result = party_manager
-            .recover_shares_via_complaint(&dealer_addr, vec![addr3, addr4].into_iter(), &p2p)
-            .await;
+        let result = DkgManager::recover_shares_via_complaint(
+            &party_manager,
+            &dealer_addr,
+            vec![addr3, addr4],
+            &p2p,
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4893,17 +4988,17 @@ mod tests {
 
         // Create party (party 1) that will request the message
         let party_address = setup.address(1);
-        let mut party_manager = setup.create_manager(1);
+        let party_manager = setup.create_manager(1);
 
         // Get dealer's message for certificate creation
         let dealer_message = dealer_manager.dealer_messages.get(&dealer_address).unwrap();
 
         // Create DkgMessage and validator signatures
         let message_hash = compute_message_hash(dealer_message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address,
             message_hash,
-        });
+        };
 
         // Dealer signs its own message
         let dealer_signature =
@@ -4924,21 +5019,33 @@ mod tests {
         dealers.insert(dealer_address, dealer_manager);
         let mock_p2p = MockP2PChannel::new(dealers, party_address);
 
+        let party_manager = Arc::new(Mutex::new(party_manager));
+
         // Party requests dealer's share from certificate signers
-        let result = party_manager
-            .retrieve_dealer_message(dkg_message.as_dkg_message(), &cert, &mock_p2p)
-            .await;
+        let result =
+            DkgManager::retrieve_dealer_message(&party_manager, &dkg_message, &cert, &mock_p2p)
+                .await;
 
         assert!(result.is_ok());
-        assert!(party_manager.dealer_messages.contains_key(&dealer_address));
+        let mgr = party_manager.lock().unwrap();
+        assert!(mgr.dealer_messages.contains_key(&dealer_address));
         // Message is stored but not yet processed (that happens during run_as_party)
-        assert!(!party_manager.dealer_outputs.contains_key(&dealer_address));
+        assert!(!mgr.dealer_outputs.contains_key(&dealer_address));
+        drop(mgr);
 
         // Process the message to verify it's valid
         party_manager
+            .lock()
+            .unwrap()
             .process_certified_dealer_message(dealer_address)
             .unwrap();
-        assert!(party_manager.dealer_outputs.contains_key(&dealer_address));
+        assert!(
+            party_manager
+                .lock()
+                .unwrap()
+                .dealer_outputs
+                .contains_key(&dealer_address)
+        );
     }
 
     #[tokio::test]
@@ -4953,21 +5060,21 @@ mod tests {
 
         // Create party that will request (validator 2)
         let party_addr = setup.address(2);
-        let mut party_mgr = setup.create_manager(2);
+        let party_mgr = setup.create_manager(2);
 
         // Get dealer's message for certificate creation
         let dealer_message = dealer_mgr.dealer_messages.get(&dealer_addr).unwrap();
 
         // Create DkgMessage
         let message_hash = compute_message_hash(dealer_message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_addr,
             message_hash,
-        });
+        };
 
         // Create certificate with two signers: validator 1 (not in P2P) and dealer (validator 0)
         // Validator 1 signs first, then validator 0
-        let validator_1_addr = Address::new([1; 32]);
+        let validator_1_addr = setup.address(1);
         let validator_1_signature =
             setup.signing_keys[1].sign(setup.epoch(), validator_1_addr, &dkg_message);
         let dealer_signature = setup.signing_keys[0].sign(setup.epoch(), dealer_addr, &dkg_message);
@@ -4986,13 +5093,20 @@ mod tests {
         managers.insert(dealer_addr, dealer_mgr);
         let mock_p2p = MockP2PChannel::new(managers, party_addr);
 
+        let party_mgr = Arc::new(Mutex::new(party_mgr));
+
         // Should succeed by trying validator 1 (fails), then dealer (succeeds)
-        let result = party_mgr
-            .retrieve_dealer_message(dkg_message.as_dkg_message(), &cert, &mock_p2p)
-            .await;
+        let result =
+            DkgManager::retrieve_dealer_message(&party_mgr, &dkg_message, &cert, &mock_p2p).await;
 
         assert!(result.is_ok());
-        assert!(party_mgr.dealer_messages.contains_key(&dealer_addr));
+        assert!(
+            party_mgr
+                .lock()
+                .unwrap()
+                .dealer_messages
+                .contains_key(&dealer_addr)
+        );
     }
 
     #[tokio::test]
@@ -5008,17 +5122,17 @@ mod tests {
 
         // Create party that will request (party 1)
         let party_addr = setup.address(1);
-        let mut party_mgr = setup.create_manager(1);
+        let party_mgr = setup.create_manager(1);
 
         // Get dealer's message for certificate creation
         let dealer_message = dealer_mgr.dealer_messages.get(&dealer_addr).unwrap();
 
         // Create DkgMessage
         let message_hash = compute_message_hash(dealer_message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_addr,
             message_hash,
-        });
+        };
 
         // Create certificate with signers including the requesting party
         // This is an invalid state - party shouldn't be retrieving a message it signed for
@@ -5039,10 +5153,11 @@ mod tests {
         managers.insert(dealer_addr, dealer_mgr);
         let mock_p2p = MockP2PChannel::new(managers, party_addr);
 
+        let party_mgr = Arc::new(Mutex::new(party_mgr));
+
         // Should abort with ProtocolFailed error due to invariant violation
-        let result = party_mgr
-            .retrieve_dealer_message(dkg_message.as_dkg_message(), &cert, &mock_p2p)
-            .await;
+        let result =
+            DkgManager::retrieve_dealer_message(&party_mgr, &dkg_message, &cert, &mock_p2p).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -5065,21 +5180,21 @@ mod tests {
 
         // Create party that will request (validator 1)
         let party_addr = setup.address(1);
-        let mut party_mgr = setup.create_manager(1);
+        let party_mgr = setup.create_manager(1);
 
         // Get dealer's message for certificate creation
         let dealer_message = dealer_mgr.dealer_messages.get(&dealer_addr).unwrap();
 
         // Create DkgMessage
         let message_hash = compute_message_hash(dealer_message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_addr,
             message_hash,
-        });
+        };
 
         // Create certificate with signers 2 and 3 (both will be offline in P2P)
-        let signer_2_addr = Address::new([2; 32]);
-        let signer_3_addr = Address::new([3; 32]);
+        let signer_2_addr = setup.address(2);
+        let signer_3_addr = setup.address(3);
         let signer_2_signature =
             setup.signing_keys[2].sign(setup.epoch(), signer_2_addr, &dkg_message);
         let signer_3_signature =
@@ -5098,15 +5213,16 @@ mod tests {
         let managers = HashMap::new();
         let mock_p2p = MockP2PChannel::new(managers, party_addr);
 
+        let party_mgr = Arc::new(Mutex::new(party_mgr));
+
         // Should fail because all signers are offline
-        let result = party_mgr
-            .retrieve_dealer_message(dkg_message.as_dkg_message(), &cert, &mock_p2p)
-            .await;
+        let result =
+            DkgManager::retrieve_dealer_message(&party_mgr, &dkg_message, &cert, &mock_p2p).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, DkgError::PairwiseCommunicationError(_)));
-        assert!(err.to_string().contains("Failed to retrieve"));
+        assert!(err.to_string().contains("Could not retrieve"));
     }
 
     #[tokio::test]
@@ -5136,7 +5252,7 @@ mod tests {
 
         // Create party that will request
         let party_addr = setup.address(2);
-        let mut party_mgr = setup.create_manager(2);
+        let party_mgr = setup.create_manager(2);
 
         // Create Byzantine signer that has WRONG message stored for dealer A
         // (It has dealer B's message stored under dealer A's key.)
@@ -5149,10 +5265,10 @@ mod tests {
 
         // Create DkgMessage for dealer A
         let message_hash_a = compute_message_hash(&message_a);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_a_addr,
             message_hash: message_hash_a,
-        });
+        };
 
         // Create valid certificate for dealer A with correct hash, signed by Byzantine signer and dealer A
         let byzantine_signature =
@@ -5175,29 +5291,36 @@ mod tests {
         managers.insert(dealer_a_addr, dealer_a_mgr);
         let mock_p2p = MockP2PChannel::new(managers, party_addr);
 
+        let party_mgr = Arc::new(Mutex::new(party_mgr));
+
         // Party requests dealer A's message
         // 1. Tries Byzantine signer first -> returns message B
         // 2. Computes hash(message B) != hash(message A) -> rejects, continues
         // 3. Tries real dealer A -> returns message A -> hash matches -> success
-        let result = party_mgr
-            .retrieve_dealer_message(dkg_message.as_dkg_message(), &cert, &mock_p2p)
-            .await;
+        let result =
+            DkgManager::retrieve_dealer_message(&party_mgr, &dkg_message, &cert, &mock_p2p).await;
 
         assert!(result.is_ok());
         // Should have dealer A's correct message (from second signer)
-        assert!(party_mgr.dealer_messages.contains_key(&dealer_a_addr));
+        assert!(
+            party_mgr
+                .lock()
+                .unwrap()
+                .dealer_messages
+                .contains_key(&dealer_a_addr)
+        );
     }
     fn create_certificate_with_signers(
         committee: &Committee,
         dealer_address: Address,
         message: &avss::Message,
         signatures: Vec<MemberSignature>,
-    ) -> DkgResult<Certificate> {
+    ) -> DkgResult<DkgCertificate> {
         let message_hash = compute_message_hash(message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address,
             message_hash,
-        });
+        };
 
         let mut aggregator = BlsSignatureAggregator::new(committee, dkg_message);
 
@@ -5599,10 +5722,10 @@ mod tests {
 
         // Create certificate signed by parties 2, 3, 4
         let message_hash = compute_message_hash(&cheating_message);
-        let dkg_message = Dkg(DkgDealerMessageHash {
+        let dkg_message = DkgDealerMessageHash {
             dealer_address: dealer_addr,
             message_hash,
-        });
+        };
         let committee = setup.committee();
         let mut aggregator = BlsSignatureAggregator::new(committee, dkg_message);
         for (_, _, sig) in &signers {
@@ -5612,7 +5735,7 @@ mod tests {
 
         // Party 0 doesn't have the message yet (simulating it wasn't received via SendMessage)
         let receiver_addr = setup.address(0);
-        let mut receiver_manager = setup.create_manager(0);
+        let receiver_manager = setup.create_manager(0);
 
         // Create P2P channel with signers who have the message
         let other_managers: HashMap<Address, DkgManager> = signers
@@ -5622,14 +5745,20 @@ mod tests {
 
         let mock_p2p = MockP2PChannel::new(other_managers, receiver_addr);
 
+        let receiver_manager = Arc::new(Mutex::new(receiver_manager));
+
         // Retrieve message - should succeed even though shares are invalid for party 0
         let dkg_dealer_hash = DkgDealerMessageHash {
             dealer_address: dealer_addr,
             message_hash,
         };
-        let result = receiver_manager
-            .retrieve_dealer_message(&dkg_dealer_hash, &certificate, &mock_p2p)
-            .await;
+        let result = DkgManager::retrieve_dealer_message(
+            &receiver_manager,
+            &dkg_dealer_hash,
+            &certificate,
+            &mock_p2p,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -5638,24 +5767,28 @@ mod tests {
         );
 
         // Verify message was stored
-        assert!(
-            receiver_manager.dealer_messages.contains_key(&dealer_addr),
-            "Invalid message should be stored for later complaint processing"
-        );
+        {
+            let mgr = receiver_manager.lock().unwrap();
+            assert!(
+                mgr.dealer_messages.contains_key(&dealer_addr),
+                "Invalid message should be stored for later complaint processing"
+            );
+        }
 
         // Now process the message - should create a complaint
         receiver_manager
+            .lock()
+            .unwrap()
             .process_certified_dealer_message(dealer_addr)
             .unwrap();
 
+        let mgr = receiver_manager.lock().unwrap();
         assert!(
-            receiver_manager
-                .complaints_to_process
-                .contains_key(&dealer_addr),
+            mgr.complaints_to_process.contains_key(&dealer_addr),
             "Processing invalid message should create complaint"
         );
         assert!(
-            !receiver_manager.dealer_outputs.contains_key(&dealer_addr),
+            !mgr.dealer_outputs.contains_key(&dealer_addr),
             "Invalid message should not create dealer output"
         );
     }
@@ -5798,7 +5931,7 @@ mod tests {
         store.pre_populate(dealer_address, original_message);
 
         // Simulate restart: create manager for same party with stored message
-        let mut restarted_manager = setup.create_manager_with_store(0, Box::new(store));
+        let restarted_manager = setup.create_manager_with_store(0, Box::new(store));
 
         // Verify message was loaded
         assert_eq!(restarted_manager.address, dealer_address);
@@ -5815,10 +5948,10 @@ mod tests {
         let mock_p2p = MockP2PChannel::new(other_managers, dealer_address);
         let mut mock_tob = MockOrderedBroadcastChannel::new(Vec::new());
 
+        let restarted_manager = Arc::new(Mutex::new(restarted_manager));
+
         // Run run_as_dealer - should reuse stored message
-        let result = restarted_manager
-            .run_as_dealer(&mock_p2p, &mut mock_tob, &mut rng)
-            .await;
+        let result = DkgManager::run_as_dealer(&restarted_manager, &mock_p2p, &mut mock_tob).await;
         assert!(result.is_ok());
 
         // Verify store_dealer_message was NOT called (message already existed)
@@ -5830,11 +5963,14 @@ mod tests {
 
         // Verify the message in dealer_messages still has the same hash
         let final_message = restarted_manager
+            .lock()
+            .unwrap()
             .dealer_messages
             .get(&dealer_address)
-            .unwrap();
+            .unwrap()
+            .clone();
         assert_eq!(
-            compute_message_hash(final_message),
+            compute_message_hash(&final_message),
             original_hash,
             "run_as_dealer should use the pre-stored message, not create a new one"
         );
@@ -5870,7 +6006,7 @@ mod tests {
 
         // Create party (validator 3) with pre-stored messages
         let party_addr = setup.address(3);
-        let mut party_manager = setup.create_manager_with_store(3, Box::new(store));
+        let party_manager = setup.create_manager_with_store(3, Box::new(store));
 
         // Verify messages were loaded on construction
         assert!(
@@ -5888,10 +6024,10 @@ mod tests {
             .map(|i| {
                 let addr = setup.address(i);
                 let message_hash = compute_message_hash(&msg1);
-                let dkg_message = Dkg(DkgDealerMessageHash {
+                let dkg_message = DkgDealerMessageHash {
                     dealer_address: dealer1_addr,
                     message_hash,
-                });
+                };
                 setup.signing_keys[i].sign(epoch, addr, &dkg_message)
             })
             .collect();
@@ -5900,10 +6036,10 @@ mod tests {
             .map(|i| {
                 let addr = setup.address(i);
                 let message_hash = compute_message_hash(&msg2);
-                let dkg_message = Dkg(DkgDealerMessageHash {
+                let dkg_message = DkgDealerMessageHash {
                     dealer_address: dealer2_addr,
                     message_hash,
-                });
+                };
                 setup.signing_keys[i].sign(epoch, addr, &dkg_message)
             })
             .collect();
@@ -5922,12 +6058,15 @@ mod tests {
         let tracking_p2p = TrackingP2PChannel::new(inner_p2p, retrieve_count.clone());
 
         // Create mock TOB with certificates
-        let mut mock_tob = MockOrderedBroadcastChannel::new(vec![cert1, cert2]);
+        let mut mock_tob = MockOrderedBroadcastChannel::new(vec![
+            CertificateV1::Dkg(cert1),
+            CertificateV1::Dkg(cert2),
+        ]);
+
+        let party_manager = Arc::new(Mutex::new(party_manager));
 
         // Run as party
-        let result = party_manager
-            .run_as_party(&tracking_p2p, &mut mock_tob)
-            .await;
+        let result = DkgManager::run_as_party(&party_manager, &tracking_p2p, &mut mock_tob).await;
         assert!(result.is_ok());
 
         // Verify retrieve_message was NOT called (messages were already in memory)
@@ -5938,12 +6077,13 @@ mod tests {
         );
 
         // Verify dealer outputs were created from stored messages
+        let mgr = party_manager.lock().unwrap();
         assert!(
-            party_manager.dealer_outputs.contains_key(&dealer1_addr),
+            mgr.dealer_outputs.contains_key(&dealer1_addr),
             "dealer1 output should be created"
         );
         assert!(
-            party_manager.dealer_outputs.contains_key(&dealer2_addr),
+            mgr.dealer_outputs.contains_key(&dealer2_addr),
             "dealer2 output should be created"
         );
     }
@@ -5951,7 +6091,7 @@ mod tests {
     /// For rotation tests that provides a completed DKG setup.
     struct RotationTestSetup {
         setup: TestSetup,
-        certificates: HashMap<Address, Certificate>,
+        certificates: HashMap<Address, CertificateV1>,
         dealer_messages: Vec<avss::Message>,
         dealer_indices: Vec<usize>,
     }
@@ -5997,7 +6137,7 @@ mod tests {
                 )
                 .unwrap();
 
-                certificates.insert(dealer_address, cert);
+                certificates.insert(dealer_address, CertificateV1::Dkg(cert));
             }
 
             Self {
@@ -6008,7 +6148,7 @@ mod tests {
             }
         }
 
-        fn certificates(&self) -> Vec<Certificate> {
+        fn certificates(&self) -> Vec<CertificateV1> {
             self.certificates.values().cloned().collect()
         }
 
@@ -6354,7 +6494,7 @@ mod tests {
                 vec![own_member_sig, test_member_sig],
             )
             .unwrap();
-            rotation_certificates.push(cert);
+            rotation_certificates.push(CertificateV1::Rotation(cert));
         }
 
         // Create mock TOB with rotation certificates
@@ -6405,10 +6545,11 @@ mod tests {
             1,
             "Test manager should have published one rotation certificate"
         );
-        match published[0].message() {
-            Rotation(m) => {
+        match &published[0] {
+            CertificateV1::Rotation(m) => {
                 assert_eq!(
-                    m.dealer_address, test_addr,
+                    m.message().dealer_address,
+                    test_addr,
                     "Published certificate should be from test manager"
                 );
             }

@@ -4971,6 +4971,7 @@ dependencies = [
  "bcs",
  "bitcoin",
  "bitcoincore-rpc",
+ "fastcrypto-tbls",
  "futures",
  "hashi",
  "prometheus",

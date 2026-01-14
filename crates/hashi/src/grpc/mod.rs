@@ -96,7 +96,7 @@ impl HttpService {
             .unwrap()
     }
 
-    pub fn dkg_manager(&self) -> &std::sync::Mutex<crate::dkg::DkgManager> {
+    pub fn dkg_manager(&self) -> &std::sync::Arc<std::sync::Mutex<crate::dkg::DkgManager>> {
         self.inner.dkg_manager()
     }
 
