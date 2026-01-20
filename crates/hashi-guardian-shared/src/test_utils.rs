@@ -1,5 +1,6 @@
 use crate::bitcoin_utils::BTC_LIB;
 use crate::Ciphertext;
+use crate::CommitteeStore;
 use crate::EncPubKey;
 use crate::EncryptedShare;
 use crate::GuardianSigned;
@@ -8,6 +9,7 @@ use crate::HashiCommitteeMember;
 use crate::OperatorInitRequest;
 use crate::ProvisionerInitRequest;
 use crate::ProvisionerInitRequestState;
+use crate::RateLimiter;
 use crate::SetupNewKeyRequest;
 use crate::SetupNewKeyResponse;
 use crate::ShareCommitment;
@@ -16,6 +18,7 @@ use crate::WithdrawalState;
 use crate::NUM_OF_SHARES;
 use bitcoin::secp256k1::Keypair;
 use bitcoin::secp256k1::SecretKey;
+use bitcoin::Amount;
 use ed25519_consensus::SigningKey;
 use fastcrypto::bls12381::min_pk::BLS12381KeyPair;
 use fastcrypto::traits::KeyPair;
@@ -105,12 +108,12 @@ impl ProvisionerInitRequest {
                     aes_ciphertext: vec![0u8; 32],
                 },
             },
-            state: ProvisionerInitRequestState::mock_for_testing(),
+            state: ProvisionerInitRequestState::mock_for_testing(None),
         }
     }
 }
 
-fn mock_committee_member() -> HashiCommitteeMember {
+pub(crate) fn mock_committee_member() -> HashiCommitteeMember {
     HashiCommitteeMember::new(
         SuiAddress::new([0u8; 32]),
         BLS12381KeyPair::from_bytes(&[1u8; 32])
@@ -122,17 +125,36 @@ fn mock_committee_member() -> HashiCommitteeMember {
     )
 }
 
+pub fn mock_committee_with_one_member() -> HashiCommittee {
+    HashiCommittee::new(vec![mock_committee_member()], 0)
+}
+
 impl ProvisionerInitRequestState {
-    pub fn mock_for_testing() -> Self {
-        let kp = create_btc_keypair(&[1u8; 32]);
+    pub fn mock_for_testing(kp: Option<Keypair>) -> Self {
+        let kp = kp.unwrap_or(create_btc_keypair(&[1u8; 32]));
+        let num_epochs_to_track = NonZeroU16::new(2).unwrap();
+        let epoch_window = crate::epoch_store::EpochWindow::new(0, num_epochs_to_track);
+        let max_withdrawable_per_epoch = Amount::from_sat(1000);
+
         ProvisionerInitRequestState {
             withdrawal_config: WithdrawalConfig {
                 committee_threshold: 0,
                 delayed_withdrawals_min_delay: Duration::from_secs(10),
                 delayed_withdrawals_timeout: Duration::from_secs(60),
             },
-            withdrawal_state: WithdrawalState::default(),
-            hashi_committee: HashiCommittee::new(vec![mock_committee_member()], 0),
+            withdrawal_state: WithdrawalState::new(
+                RateLimiter::new(
+                    epoch_window,
+                    vec![Amount::from_sat(0)],
+                    max_withdrawable_per_epoch,
+                )
+                .unwrap(),
+            ),
+            hashi_committees: CommitteeStore::new(
+                epoch_window,
+                vec![mock_committee_with_one_member()],
+            )
+            .unwrap(),
             hashi_btc_master_pubkey: kp.x_only_public_key().0,
         }
     }
