@@ -4,6 +4,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GuardianError {
     InternalError(String),
+    /// Internal errors related to S3
+    S3Error(String),
     InvalidInputs(String),
 }
 
@@ -14,6 +16,7 @@ impl std::fmt::Display for GuardianError {
         match self {
             GuardianError::InternalError(e) => write!(f, "InternalError: {}", e),
             GuardianError::InvalidInputs(e) => write!(f, "InvalidInputs: {}", e),
+            GuardianError::S3Error(e) => write!(f, "S3Error: {}", e),
         }
     }
 }

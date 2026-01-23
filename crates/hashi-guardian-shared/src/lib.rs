@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod epoch_store;
 pub mod errors;
 pub mod proto_conversions;
+pub mod s3_logger;
 pub mod test_utils;
 
 use crate::bitcoin_utils::InputUTXO;
@@ -37,7 +38,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::time::SystemTime;
-
+use std::time::UNIX_EPOCH;
 // ---------------------------------
 //          Intents
 // ---------------------------------
@@ -53,11 +54,26 @@ pub enum IntentType {
     SetupNewKeyResponse = 1,
     /// Intent for StandardWithdrawalResponse
     StandardWithdrawalResponse = 2,
+    /// Intent for GuardianInfo
+    GuardianInfo = 3,
 }
 
 /// Trait for types that can be signed, providing domain separation via an intent.
 pub trait SigningIntent {
     const INTENT: IntentType;
+}
+
+// ---------------------------------
+//          Time
+// ---------------------------------
+
+/// Milliseconds since Unix epoch.
+/// Panics if the system clock is before `UNIX_EPOCH`.
+pub fn now_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system_time cannot be before Unix epoch")
+        .as_millis() as u64
 }
 
 // ---------------------------------
@@ -68,14 +84,17 @@ pub trait SigningIntent {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Timestamped<T> {
     pub data: T,
-    pub timestamp: SystemTime,
+    /// Milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
 }
 
 /// Guardian-signed wrapper - adds timestamp and signature to any data
+/// TODO: Impl custom ser/deser for GuardianSignature as signatures are displayed as long bytes in S3 logs
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct GuardianSigned<T> {
     pub data: T,
-    pub timestamp: SystemTime,
+    /// Milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
     pub signature: GuardianSignature,
 }
 
@@ -126,8 +145,23 @@ pub struct ProvisionerInitState {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct GetGuardianInfoResponse {
-    /// Attestation document serialized in Hex
+    /// AWS Nitro attestation
     pub attestation: Attestation,
+    /// Signing pub key of the guardian
+    pub signing_pub_key: GuardianPubKey,
+    /// Signed guardian info
+    pub signed_info: GuardianSigned<GuardianInfo>,
+}
+
+/// TODO: Add network?
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct GuardianInfo {
+    /// Share commitments (if set). Used by KPs to check that right key will be used.
+    pub share_commitments: Option<Vec<ShareCommitment>>,
+    /// S3 bucket name (if set). Used by KPs to check S3 bucket info.
+    pub bucket_info: Option<S3BucketInfo>,
+    /// Encryption key. Used by KPs to encrypt their shares.
+    pub encryption_pubkey: EncPubKeyBytes,
     /// Server version
     /// TODO: Replace with hashi ServerVersion to include crate SHA and version
     pub server_version: String,
@@ -164,7 +198,7 @@ pub enum LogMessage {
         signing_public_key: GuardianPubKey,
     },
     /// Share commitments given in /operator_init
-    OperatorInitShareCommitments(Vec<ShareCommitment>),
+    GuardianInfo(GuardianInfo),
     /// A successful /setup_new_key call
     SetupNewKeySuccess {
         encrypted_shares: Vec<EncryptedShare>,
@@ -206,7 +240,13 @@ pub type Attestation = Vec<u8>;
 pub struct S3Config {
     pub access_key: String,
     pub secret_key: String,
-    pub bucket_name: String,
+    pub bucket_info: S3BucketInfo,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct S3BucketInfo {
+    pub bucket: String,
+    pub region: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -251,6 +291,20 @@ impl SigningIntent for SetupNewKeyResponse {
 
 impl SigningIntent for StandardWithdrawalResponse {
     const INTENT: IntentType = IntentType::StandardWithdrawalResponse;
+}
+
+impl SigningIntent for GuardianInfo {
+    const INTENT: IntentType = IntentType::GuardianInfo;
+}
+
+impl S3Config {
+    pub fn bucket_name(&self) -> &str {
+        &self.bucket_info.bucket
+    }
+
+    pub fn region(&self) -> &str {
+        &self.bucket_info.region
+    }
 }
 
 impl SetupNewKeyRequest {
@@ -302,6 +356,10 @@ impl OperatorInitRequest {
 
     pub fn network(&self) -> Network {
         self.network
+    }
+
+    pub fn into_parts(self) -> (S3Config, Vec<ShareCommitment>, Network) {
+        (self.s3_config, self.share_commitments, self.network)
     }
 }
 

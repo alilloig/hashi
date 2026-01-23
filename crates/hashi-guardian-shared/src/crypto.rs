@@ -23,7 +23,6 @@ use rand_core::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
 use std::num::NonZeroU16;
-use std::time::SystemTime;
 use tracing::info;
 // ---------------------------------
 //      Crypto Structs & Types
@@ -31,6 +30,7 @@ use tracing::info;
 
 pub type EncSecKey = <X25519HkdfSha256 as Kem>::PrivateKey;
 pub type EncPubKey = <X25519HkdfSha256 as Kem>::PublicKey;
+pub type EncPubKeyBytes = Vec<u8>; // Use as an alternative to EncPubKey where Serialize is needed
 pub struct GuardianEncKeyPair {
     sk: EncSecKey,
     pk: EncPubKey,
@@ -276,13 +276,13 @@ pub fn decrypt_share(
 impl<T: Serialize + SigningIntent> GuardianSigned<T> {
     /// Create a new signed payload (used by enclave)
     /// Includes intent byte for domain separation to prevent cross-type signature attacks
-    pub fn new(data: T, signing_key: &SigningKey, timestamp: SystemTime) -> Self {
-        let tuple = (T::INTENT, &data, timestamp);
+    pub fn new(data: T, signing_key: &SigningKey, timestamp_ms: u64) -> Self {
+        let tuple = (T::INTENT, &data, timestamp_ms);
         let signing_payload = bcs::to_bytes(&tuple).expect("serialization should not fail");
         let signature = signing_key.sign(&signing_payload);
         Self {
             data,
-            timestamp,
+            timestamp_ms,
             signature,
         }
     }
@@ -290,7 +290,7 @@ impl<T: Serialize + SigningIntent> GuardianSigned<T> {
     /// Verify signature and extract payload
     /// Checks intent byte to ensure signature is for the correct type
     pub fn verify(self, pub_key: &VerificationKey) -> GuardianResult<T> {
-        let tuple = (T::INTENT, &self.data, self.timestamp);
+        let tuple = (T::INTENT, &self.data, self.timestamp_ms);
         let msg_bytes = bcs::to_bytes(&tuple).expect("serialization should not fail");
         pub_key
             .verify(&self.signature, &msg_bytes)
