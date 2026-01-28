@@ -48,6 +48,8 @@ impl std::fmt::Debug for OnchainState {
 #[derive(Clone, Debug)]
 pub enum Notification {
     ValidatorInfoUpdated(Address),
+    /// Reconfig started, transitioning to the given epoch.
+    StartReconfig(u64),
 }
 
 /// Information about the latest processed checkpoint
@@ -196,29 +198,32 @@ impl OnchainState {
         Ok(None)
     }
 
-    /// Fetches all DKG certificates for the given epoch from on-chain.
-    /// Returns raw move types; caller is responsible for conversion.
-    pub async fn fetch_dkg_certs(
+    /// Fetches all certificates for the given epoch from on-chain.
+    /// Returns the protocol type and raw move types; caller is responsible for conversion.
+    pub async fn fetch_certs(
         &self,
         epoch: u64,
     ) -> Result<
-        Vec<(
-            Address,
-            move_types::CertifiedMessage<move_types::DkgDealerMessageHashV1>,
+        Option<(
+            move_types::ProtocolType,
+            Vec<(
+                Address,
+                move_types::CertifiedMessage<move_types::DealerMessagesHashV1>,
+            )>,
         )>,
     > {
         let epoch_certs = match self.fetch_epoch_certs(epoch).await? {
             Some(certs) => certs,
-            None => return Ok(vec![]),
+            None => return Ok(None),
         };
-        let Some(head) = epoch_certs.dkg_certs.head else {
-            return Ok(vec![]);
+        let Some(head) = epoch_certs.certs.head else {
+            return Ok(Some((epoch_certs.protocol_type, vec![])));
         };
         let mut nodes: std::collections::HashMap<
             Address,
             move_types::LinkedTableNode<
                 Address,
-                move_types::CertifiedMessage<move_types::DkgDealerMessageHashV1>,
+                move_types::CertifiedMessage<move_types::DealerMessagesHashV1>,
             >,
         > = std::collections::HashMap::new();
         let mut stream = self
@@ -227,7 +232,7 @@ impl OnchainState {
             .clone()
             .list_dynamic_fields(
                 ListDynamicFieldsRequest::default()
-                    .with_parent(epoch_certs.dkg_certs.id)
+                    .with_parent(epoch_certs.certs.id)
                     .with_page_size(u32::MAX)
                     .with_read_mask(FieldMask::from_paths([
                         DynamicField::path_builder().name().finish(),
@@ -250,7 +255,7 @@ impl OnchainState {
             certificates.push((dealer, node.value));
             current = node.next;
         }
-        Ok(certificates)
+        Ok(Some((epoch_certs.protocol_type, certificates)))
     }
 }
 

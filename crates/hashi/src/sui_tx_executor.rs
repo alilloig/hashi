@@ -356,24 +356,22 @@ impl SuiTxExecutor {
         anyhow::bail!("DepositRequestedEvent not found in transaction events")
     }
 
-    /// Execute a DKG certificate submission transaction.
+    /// Execute a certificate submission transaction.
     ///
-    /// This submits a DKG certificate to the on-chain certificate store.
+    /// This submits a DKG or rotation certificate to the on-chain certificate store.
     /// The certificate contains the dealer's message hash and committee signature.
-    pub async fn execute_submit_dkg_certificate(
-        &mut self,
-        cert: &CertificateV1,
-    ) -> anyhow::Result<()> {
-        let CertificateV1::Dkg(dkg_cert) = cert else {
-            anyhow::bail!("Rotation certificates not supported yet");
+    pub async fn execute_submit_certificate(&mut self, cert: &CertificateV1) -> anyhow::Result<()> {
+        let (inner_cert, function_name) = match cert {
+            CertificateV1::Dkg(c) => (c, "submit_dkg_cert"),
+            CertificateV1::Rotation(c) => (c, "submit_rotation_cert"),
         };
 
-        let message = dkg_cert.message();
+        let message = inner_cert.message();
         let dealer = message.dealer_address;
         let message_hash = message.messages_hash.inner().to_vec();
-        let epoch = dkg_cert.epoch();
-        let signature = dkg_cert.signature_bytes().to_vec();
-        let signers_bitmap = dkg_cert.signers_bitmap_bytes().to_vec();
+        let epoch = inner_cert.epoch();
+        let signature = inner_cert.signature_bytes().to_vec();
+        let signers_bitmap = inner_cert.signers_bitmap_bytes().to_vec();
 
         let mut builder = TransactionBuilder::new();
 
@@ -393,7 +391,7 @@ impl SuiTxExecutor {
             Function::new(
                 self.hashi_ids.package_id,
                 Identifier::from_static("cert_submission"),
-                Identifier::from_static("submit_dkg_cert"),
+                Identifier::new(function_name).expect("valid identifier"),
             ),
             vec![
                 hashi_arg,
@@ -408,7 +406,7 @@ impl SuiTxExecutor {
         let response = self.execute(builder).await?;
         if !response.transaction().effects().status().success() {
             anyhow::bail!(
-                "DKG certificate submission failed: {:?}",
+                "Certificate submission failed: {:?}",
                 response.transaction().effects().status()
             );
         }
