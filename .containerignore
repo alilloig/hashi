@@ -2,4 +2,5 @@
 target/
 packages/
 design/
+docker/
 .github/
