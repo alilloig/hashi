@@ -32,6 +32,7 @@ use crate::rpc::GuardianGrpc;
 use crate::s3_logger::S3Logger;
 use hashi_types::committee::Committee as HashiCommittee;
 use hashi_types::guardian::epoch_store::ConsecutiveEpochStore;
+use hashi_types::guardian::InitLogMessage::OIAttestationUnsigned;
 use hashi_types::proto::guardian_service_server::GuardianServiceServer;
 
 /// Enclave's config & state
@@ -82,6 +83,12 @@ pub struct Scratchpad {
     pub share_commitments: OnceLock<Vec<ShareCommitment>>,
     /// Hash of the state in ProvisionerInitRequest
     pub state_hash: OnceLock<[u8; 32]>,
+    /// Set once operator_init has successfully written all logs to S3.
+    /// This prevents heartbeats from being emitted before operator_init logs.
+    pub operator_init_logging_complete: OnceLock<()>,
+    /// Set once the provisioner init flow has successfully logged EnclaveFullyInitialized.
+    /// This prevents withdrawals from starting before provisioner_init logs.
+    pub provisioner_init_logging_complete: OnceLock<()>,
 }
 
 pub struct EphemeralKeyPairs {
@@ -447,7 +454,13 @@ impl Enclave {
     }
 
     pub fn is_provisioner_init_complete(&self) -> bool {
-        self.config.is_provisioner_init_complete() && self.state.is_provisioner_init_complete()
+        self.config.is_provisioner_init_complete()
+            && self.state.is_provisioner_init_complete()
+            && self
+                .scratchpad
+                .provisioner_init_logging_complete
+                .get()
+                .is_some()
     }
 
     pub fn is_provisioner_init_partially_complete(&self) -> bool {
@@ -456,7 +469,13 @@ impl Enclave {
     }
 
     pub fn is_operator_init_complete(&self) -> bool {
-        self.config.is_operator_init_complete() && self.scratchpad.share_commitments.get().is_some()
+        self.config.is_operator_init_complete()
+            && self.scratchpad.share_commitments.get().is_some()
+            && self
+                .scratchpad
+                .operator_init_logging_complete
+                .get()
+                .is_some()
     }
 
     pub fn is_operator_init_partially_complete(&self) -> bool {
@@ -516,33 +535,74 @@ impl Enclave {
     // ========================================================================
 
     /// A unique session ID for the current enclave session.
-    /// Logs are organized as follows: SessionId/xyz.json
     pub fn s3_session_id(&self) -> String {
         self.signing_pubkey().as_bytes().to_lower_hex_string()
     }
 
-    /// Sign and log a LogMessage to S3. Only LogMessage variants can be logged to enforce consistency.
+    /// Log an init message at a deterministic semantic key.
     ///
-    /// Throws: InvalidInputs (if logger is not init) or S3Error.
-    pub async fn sign_and_log(&self, data: LogMessage) -> GuardianResult<()> {
-        let signed = self.sign(data);
-        // TODO: change duration based on env (prod/test) and LogMessage type
-        let object_lock_duration = Duration::from_mins(5);
+    /// Init messages are expected to be logged in the following order.
+    /// OIAttestationUnsigned -> OIGuardianInfo -> PISuccess (T times) -> PIEnclaveFullyInitialized.
+    pub async fn log_init(&self, msg: InitLogMessage) -> GuardianResult<()> {
+        let suffix = match &msg {
+            InitLogMessage::OIAttestationUnsigned { .. } => "oi-attestation-unsigned".to_string(),
+            InitLogMessage::OIGuardianInfo(_) => "oi-guardian-info".to_string(),
+            InitLogMessage::SetupNewKeySuccess { .. } => "setup-new-key-success".to_string(),
+            InitLogMessage::PISuccess { share_id, .. } => {
+                format!("pi-success-share-{}", share_id.get())
+            }
+            InitLogMessage::PIEnclaveFullyInitialized => "pi-enclave-fully-initialized".to_string(),
+        };
+
+        let env = match msg {
+            OIAttestationUnsigned { .. } => LogMessageEnvelope::Timestamped(Timestamped {
+                data: LogMessage::Init(Box::new(msg)),
+                timestamp_ms: now_timestamp_ms(),
+            }),
+            _ => LogMessageEnvelope::Signed(self.sign(LogMessage::Init(Box::new(msg)))),
+        };
+
         self.config
             .s3_logger()?
-            .write(&signed, object_lock_duration)
+            .write_init_with_suffix(&suffix, &env, S3_OBJECT_LOCK_DURATION_INIT)
             .await
     }
 
-    /// Log unsigned data to S3 with timestamp.
-    /// Only LogMessage variants can be logged to enforce consistency.
-    pub async fn timestamp_and_log(&self, data: LogMessage) -> GuardianResult<()> {
-        let timestamp_ms = now_timestamp_ms();
-        let timestamped = Timestamped { data, timestamp_ms };
-        let object_lock_duration = Duration::from_mins(5);
+    pub async fn log_withdraw(&self, msg: WithdrawalLogMessage) -> GuardianResult<()> {
+        let status = match &msg {
+            WithdrawalLogMessage::Success { .. } => "success",
+            WithdrawalLogMessage::Failure { .. } => "failure",
+        };
+        let wid = msg.wid();
+        let env = LogMessageEnvelope::Signed(self.sign(LogMessage::Withdrawal(Box::new(msg))));
+        let suffix = format!("wid{}-{}-{:08x}", wid, status, rand::random::<u32>());
+
         self.config
             .s3_logger()?
-            .write(&timestamped, object_lock_duration)
+            .write_hour_partitioned_with_suffix(
+                S3_DIR_WITHDRAW,
+                env.timestamp_ms(),
+                &suffix,
+                &env,
+                S3_OBJECT_LOCK_DURATION_WITHDRAW,
+            )
+            .await
+    }
+
+    /// Throws: InvalidInputs (if logger is not init) or S3Error.
+    pub async fn log_heartbeat_at_seq(&self, seq: u64) -> GuardianResult<()> {
+        let env = LogMessageEnvelope::Signed(self.sign(LogMessage::Heartbeat));
+        let suffix = format!("{:020}", seq);
+
+        self.config
+            .s3_logger()?
+            .write_hour_partitioned_with_suffix(
+                S3_DIR_HEARTBEAT,
+                env.timestamp_ms(),
+                &suffix,
+                &env,
+                S3_OBJECT_LOCK_DURATION_HEARTBEAT,
+            )
             .await
     }
 
@@ -706,6 +766,13 @@ impl Enclave {
 
         // Set share commitments
         enclave.set_share_commitments(args.commitments).unwrap();
+
+        // In tests, treat "operator initialized" as including the operator-init identity logs.
+        enclave
+            .scratchpad
+            .operator_init_logging_complete
+            .set(())
+            .expect("operator_init_logging_complete should only be set once");
 
         assert!(enclave.is_operator_init_complete() && !enclave.is_provisioner_init_complete());
 
