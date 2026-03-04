@@ -2819,7 +2819,7 @@ mod tests {
                         validator_address: addr,
                         operator_address: addr,
                         next_epoch_public_key: signing_keys[i].public_key(),
-                        https_address: None,
+                        endpoint_url: None,
                         tls_public_key: None,
                         next_epoch_encryption_public_key,
                     };
@@ -2884,7 +2884,7 @@ mod tests {
                         validator_address: addr,
                         operator_address: addr,
                         next_epoch_public_key: signing_keys[i].public_key(),
-                        https_address: None,
+                        endpoint_url: None,
                         tls_public_key: None,
                         next_epoch_encryption_public_key,
                     };
@@ -3604,7 +3604,7 @@ mod tests {
                     validator_address: addr,
                     operator_address: addr,
                     next_epoch_public_key: signing_keys[i].public_key(),
-                    https_address: None,
+                    endpoint_url: None,
                     tls_public_key: None,
                     next_epoch_encryption_public_key: Some(PublicKey::from_private_key(
                         &encryption_keys[i],
