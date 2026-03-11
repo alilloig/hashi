@@ -144,12 +144,29 @@ impl BtcRpcAuth {
     }
 }
 
+/// Parse a human-readable network name into a [`Network`].
+///
+/// Recognised values: `"mainnet"`, `"testnet4"`, `"regtest"`.
+/// Returns [`Network::Regtest`] when `name` is `None`.
+/// Returns an error for unrecognised network names.
+pub fn parse_btc_network(name: Option<&str>) -> anyhow::Result<Network> {
+    match name {
+        Some("mainnet") => Ok(Network::Bitcoin),
+        Some("testnet4") => Ok(Network::Testnet4),
+        Some("regtest") | None => Ok(Network::Regtest),
+        Some(other) => anyhow::bail!(
+            "Unknown BTC network '{}'. Use mainnet, testnet4, or regtest",
+            other
+        ),
+    }
+}
+
 pub fn network_from_chain_id(chain_id: &str) -> Option<Network> {
     let hash = BlockHash::from_str(chain_id).ok()?;
 
     [
         Network::Bitcoin,
-        Network::Testnet,
+        Network::Testnet4,
         Network::Signet,
         Network::Regtest,
     ]
@@ -169,10 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn test_testnet_genesis_mapping() {
-        let mainnet_id = "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943";
-        let network = network_from_chain_id(mainnet_id);
-        assert_eq!(network, Some(Network::Testnet));
+    fn test_testnet4_genesis_mapping() {
+        let testnet4_id = "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043";
+        let network = network_from_chain_id(testnet4_id);
+        assert_eq!(network, Some(Network::Testnet4));
     }
 
     #[test]

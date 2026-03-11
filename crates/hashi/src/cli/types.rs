@@ -30,10 +30,17 @@ pub mod display {
 
     /// Format a timestamp in human-readable form
     pub fn format_timestamp(timestamp_ms: u64) -> String {
-        use std::time::Duration;
-        use std::time::UNIX_EPOCH;
-        let datetime = UNIX_EPOCH + Duration::from_millis(timestamp_ms);
-        format!("{:?}", datetime)
+        let ts = jiff::Timestamp::from_millisecond(timestamp_ms as i64)
+            .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+        let dt = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+            dt.year(),
+            dt.month() as u8,
+            dt.day(),
+            dt.hour(),
+            dt.minute()
+        )
     }
 
     /// Format proposal type for display (from on-chain type)
