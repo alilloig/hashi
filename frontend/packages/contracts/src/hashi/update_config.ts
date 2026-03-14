@@ -8,16 +8,19 @@ import {
 } from "../utils/index.js";
 import { bcs } from "@mysten/sui/bcs";
 import { type Transaction } from "@mysten/sui/transactions";
-const $moduleName = "@local-pkg/hashi::update_deposit_fee";
-export const UpdateDepositFee = new MoveStruct({
-  name: `${$moduleName}::UpdateDepositFee`,
+import * as config_value from "./config_value.js";
+const $moduleName = "@local-pkg/hashi::update_config";
+export const UpdateConfig = new MoveStruct({
+  name: `${$moduleName}::UpdateConfig`,
   fields: {
-    fee: bcs.u64(),
+    key: bcs.string(),
+    value: config_value.Value,
   },
 });
 export interface ProposeArguments {
   hashi: RawTransactionArgument<string>;
-  fee: RawTransactionArgument<number | bigint>;
+  key: RawTransactionArgument<string>;
+  value: RawTransactionArgument<string>;
   metadata: RawTransactionArgument<string>;
 }
 export interface ProposeOptions {
@@ -26,21 +29,25 @@ export interface ProposeOptions {
     | ProposeArguments
     | [
         hashi: RawTransactionArgument<string>,
-        fee: RawTransactionArgument<number | bigint>,
+        key: RawTransactionArgument<string>,
+        value: RawTransactionArgument<string>,
         metadata: RawTransactionArgument<string>,
       ];
 }
 export function propose(options: ProposeOptions) {
   const packageAddress = options.package ?? "@local-pkg/hashi";
-  const argumentsTypes = [null, "u64", null, "0x2::clock::Clock"] satisfies (
-    | string
-    | null
-  )[];
-  const parameterNames = ["hashi", "fee", "metadata"];
+  const argumentsTypes = [
+    null,
+    "0x1::string::String",
+    null,
+    null,
+    "0x2::clock::Clock",
+  ] satisfies (string | null)[];
+  const parameterNames = ["hashi", "key", "value", "metadata"];
   return (tx: Transaction) =>
     tx.moveCall({
       package: packageAddress,
-      module: "update_deposit_fee",
+      module: "update_config",
       function: "propose",
       arguments: normalizeMoveArguments(
         options.arguments,
@@ -73,7 +80,7 @@ export function execute(options: ExecuteOptions) {
   return (tx: Transaction) =>
     tx.moveCall({
       package: packageAddress,
-      module: "update_deposit_fee",
+      module: "update_config",
       function: "execute",
       arguments: normalizeMoveArguments(
         options.arguments,
